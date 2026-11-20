@@ -1,15 +1,5 @@
 import type { Candle, Timeframe } from '../src/engine/types.ts';
-import {
-  DEFAULT_BASIS_EMA_ALPHA,
-  DEFAULT_MAX_BASIS_ABS_USD,
-  HIGH_BASIS_DIVERGENCE_THRESHOLD_USD,
-  aggregateSpotTicksToCandles,
-  calibrateCandlesToSpot,
-  updateRollingBasisEma,
-  type BasisObservation,
-  type CalibratedCandle,
-  type SpotTickSample,
-} from '../src/engine/chartEngine.ts';
+import { calibrateCandlesToSpot } from '../src/engine/chartEngine.ts';
 import { chartStore } from './timescaleStore.ts';
 
 export interface SpotBasisQuote {
@@ -20,23 +10,18 @@ export interface SpotBasisQuote {
   spotSource: string;
   paxgMid: number | null;
   basisUsd: number;
-  rollingBasisEmaUsd?: number;
-  highBasisDivergence?: boolean;
   fetchedAtMs: number;
 }
 
 export interface CalibratedCandleResponse {
   ok: boolean;
   timeframe: Timeframe;
-  candles: CalibratedCandle[];
+  candles: Candle[];
   source: string;
-  rawFeed: 'BINANCE_PAXGUSDT' | 'OKX_XAUTUSDT' | 'YAHOO_GCF' | 'TIMESCALEDB' | 'SWISSQUOTE_NATIVE';
+  rawFeed: 'BINANCE_PAXGUSDT' | 'OKX_XAUTUSDT' | 'YAHOO_GCF' | 'TIMESCALEDB';
   calibratedToSpot: boolean;
   spotReference: number | null;
   basisOffsetUsd: number;
-  rollingBasisEmaUsd?: number;
-  highBasisDivergenceBars?: number;
-  nativeSpotBarCount?: number;
   storageBackend: 'timescaledb' | 'memory';
   barCount: number;
   fetchedAtMs: number;
@@ -86,77 +71,6 @@ interface CachedTfEntry {
 const tfCache = new Map<Timeframe, CachedTfEntry>();
 let cachedQuote: SpotBasisQuote | null = null;
 let quoteExpiresAtMs = 0;
-
-// Exponential Rolling Basis Calibrator state (alpha = 0.15, clamped to +/-$35.00)
-const MAX_BASIS_HISTORY = 720;
-const MAX_SPOT_TICKS = 4800;
-let rollingBasisEmaUsd: number | null = null;
-let lastHighBasisDivergence = false;
-const basisHistory: BasisObservation[] = [];
-const spotTickRing: SpotTickSample[] = [];
-
-export function recordSpotTick(spotMid: number, timestampMs = Date.now(), volume = 1): void {
-  if (!Number.isFinite(spotMid) || spotMid <= 0) return;
-  const timeSec = Math.floor(timestampMs / 1000);
-  spotTickRing.push({ timeSec, price: Number(spotMid.toFixed(2)), volume });
-  if (spotTickRing.length > MAX_SPOT_TICKS) {
-    spotTickRing.splice(0, spotTickRing.length - MAX_SPOT_TICKS);
-  }
-}
-
-export function recordBasisObservation(rawBasisUsd: number, timestampMs = Date.now()): {
-  rollingBasisEmaUsd: number;
-  highBasisDivergence: boolean;
-} {
-  const stepped = updateRollingBasisEma(
-    rollingBasisEmaUsd,
-    rawBasisUsd,
-    DEFAULT_BASIS_EMA_ALPHA,
-    DEFAULT_MAX_BASIS_ABS_USD,
-    HIGH_BASIS_DIVERGENCE_THRESHOLD_USD
-  );
-  rollingBasisEmaUsd = stepped.basisUsd;
-  lastHighBasisDivergence = stepped.highBasisDivergence;
-
-  const bucketSec = Math.floor(timestampMs / 15_000) * 15;
-  const prev = basisHistory[basisHistory.length - 1];
-  if (prev && prev.time === bucketSec) {
-    prev.basisUsd = stepped.basisUsd;
-  } else {
-    basisHistory.push({ time: bucketSec, basisUsd: stepped.basisUsd });
-    if (basisHistory.length > MAX_BASIS_HISTORY) {
-      basisHistory.shift();
-    }
-  }
-  return {
-    rollingBasisEmaUsd: stepped.basisUsd,
-    highBasisDivergence: stepped.highBasisDivergence,
-  };
-}
-
-export function getNativeSpotCandles(timeframe: Timeframe, limit = 240): CalibratedCandle[] {
-  return aggregateSpotTicksToCandles(spotTickRing, timeframe, Math.max(10, Math.min(300, limit)));
-}
-
-export function getRollingBasisState(): {
-  alpha: number;
-  maxBasisAbsUsd: number;
-  highDivergenceThresholdUsd: number;
-  rollingBasisEmaUsd: number | null;
-  highBasisDivergence: boolean;
-  historyCount: number;
-  nativeTickCount: number;
-} {
-  return {
-    alpha: DEFAULT_BASIS_EMA_ALPHA,
-    maxBasisAbsUsd: DEFAULT_MAX_BASIS_ABS_USD,
-    highDivergenceThresholdUsd: HIGH_BASIS_DIVERGENCE_THRESHOLD_USD,
-    rollingBasisEmaUsd,
-    highBasisDivergence: lastHighBasisDivergence,
-    historyCount: basisHistory.length,
-    nativeTickCount: spotTickRing.length,
-  };
-}
 
 async function fetchJsonFast(url: string, timeoutMs = 3200): Promise<unknown> {
   const controller = new AbortController();
@@ -222,18 +136,7 @@ export async function fetchLiveSpotAndBasis(force = false): Promise<SpotBasisQuo
 
   const spotMid = Number(((spotBid + spotAsk) / 2).toFixed(2));
   const spread = Number(Math.max(0.02, spotAsk - spotBid).toFixed(2));
-  const rawBasisUsd = paxgMid !== null ? Number((spotMid - paxgMid).toFixed(2)) : 0;
-
-  if (spotSource === 'Swissquote Interbank BBO') {
-    recordSpotTick(spotMid, now, 1);
-  }
-  const basisState =
-    paxgMid !== null
-      ? recordBasisObservation(rawBasisUsd, now)
-      : {
-          rollingBasisEmaUsd: rollingBasisEmaUsd ?? 0,
-          highBasisDivergence: lastHighBasisDivergence,
-        };
+  const basisUsd = paxgMid !== null ? Number((spotMid - paxgMid).toFixed(2)) : 0;
 
   cachedQuote = {
     spotMid,
@@ -242,9 +145,7 @@ export async function fetchLiveSpotAndBasis(force = false): Promise<SpotBasisQuo
     spread,
     spotSource,
     paxgMid,
-    basisUsd: rawBasisUsd,
-    rollingBasisEmaUsd: basisState.rollingBasisEmaUsd,
-    highBasisDivergence: basisState.highBasisDivergence,
+    basisUsd,
     fetchedAtMs: now,
   };
   quoteExpiresAtMs = now + 3_500;
@@ -441,42 +342,23 @@ export async function fetchCalibratedCandles(
     }
   }
 
-  // Calibrate onto Swissquote Interbank XAU/USD Spot using Exponential Rolling Basis Calibrator (alpha=0.15, +/-$35 clamp)
+  // Calibrate onto Swissquote Interbank XAU/USD Spot so historical OHLC matches Interbank Spot
   const lastRawClose = rawCandles[rawCandles.length - 1]?.close ?? 0;
-  let instantaneousBasis = 0;
-  let effectiveBasisOffset = rollingBasisEmaUsd ?? 0;
+  let basisOffset = 0;
   let calibratedToSpot = false;
 
   if (quote && quote.spotMid > 0 && lastRawClose > 0) {
     if (rawFeed === 'BINANCE_PAXGUSDT' && quote.paxgMid !== null) {
-      instantaneousBasis = quote.basisUsd;
-      effectiveBasisOffset = quote.rollingBasisEmaUsd ?? quote.basisUsd;
+      basisOffset = quote.basisUsd;
     } else {
-      instantaneousBasis = Number((quote.spotMid - lastRawClose).toFixed(2));
-      const updated = updateRollingBasisEma(
-        rollingBasisEmaUsd,
-        instantaneousBasis,
-        DEFAULT_BASIS_EMA_ALPHA,
-        DEFAULT_MAX_BASIS_ABS_USD,
-        HIGH_BASIS_DIVERGENCE_THRESHOLD_USD
-      );
-      effectiveBasisOffset = updated.basisUsd;
+      basisOffset = Number((quote.spotMid - lastRawClose).toFixed(2));
     }
     calibratedToSpot = true;
   }
 
-  const nativeSpotCandles = getNativeSpotCandles(timeframe, safeLimit);
-  const calibrated = calibrateCandlesToSpot(rawCandles, effectiveBasisOffset, quote?.spotMid ?? null, {
-    alpha: DEFAULT_BASIS_EMA_ALPHA,
-    maxBasisAbsUsd: DEFAULT_MAX_BASIS_ABS_USD,
-    highDivergenceThresholdUsd: HIGH_BASIS_DIVERGENCE_THRESHOLD_USD,
-    basisHistory: rawFeed === 'BINANCE_PAXGUSDT' ? basisHistory : undefined,
-    nativeSpotCandles,
-  });
-
-  const highBasisDivergenceBars = calibrated.filter((c) => c.highBasisDivergence).length;
+  const calibrated = calibrateCandlesToSpot(rawCandles, basisOffset, quote?.spotMid ?? null, 35);
   const fullSource = calibratedToSpot
-    ? `${quote?.spotSource ?? 'Swissquote Spot'} + ${sourceLabel} (EMA α=0.15 Calibrated)`
+    ? `${quote?.spotSource ?? 'Swissquote Spot'} + ${sourceLabel} (Calibrated)`
     : sourceLabel;
 
   // Persist asynchronously into TimescaleDB / Memory store
@@ -490,10 +372,7 @@ export async function fetchCalibratedCandles(
     rawFeed,
     calibratedToSpot,
     spotReference: quote?.spotMid ?? (calibrated[calibrated.length - 1]?.close ?? null),
-    basisOffsetUsd: effectiveBasisOffset,
-    rollingBasisEmaUsd: effectiveBasisOffset,
-    highBasisDivergenceBars,
-    nativeSpotBarCount: nativeSpotCandles.length,
+    basisOffsetUsd: basisOffset,
     storageBackend: chartStore.getStatus().driver,
     barCount: calibrated.length,
     fetchedAtMs: now,

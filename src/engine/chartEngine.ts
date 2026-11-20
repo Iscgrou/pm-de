@@ -385,346 +385,56 @@ export function formatCandleCountdown(nowMs: number, timeframe: Timeframe): stri
   return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
 }
 
-export interface CalibratedCandle extends Candle {
-  /** True when the effective spot-to-proxy basis divergence exceeds $6.00 */
-  highBasisDivergence?: boolean;
-  /** Applied exponentially smoothed basis offset (USD) for this bar */
-  appliedBasisOffsetUsd?: number;
-}
-
-export interface BasisObservation {
-  time: number; // unix seconds
-  basisUsd: number;
-}
-
-export interface SpotTickSample {
-  timeSec: number; // unix seconds
-  price: number;
-  volume?: number;
-}
-
-export interface SpotCalibrationOptions {
-  /** Exponential smoothing factor (default 0.15) */
-  alpha?: number;
-  /** Symmetric clamp ceiling for basis offset in USD (default 35.0) */
-  maxBasisAbsUsd?: number;
-  /** Threshold above which a bar is flagged highBasisDivergence: true (default 6.0) */
-  highDivergenceThresholdUsd?: number;
-  /** Optional chronological spot-minus-proxy basis observations */
-  basisHistory?: BasisObservation[];
-  /** Optional initial EMA seed basis offset */
-  initialBasisUsd?: number;
-  /** Optional native interbank spot candles aligned on the same timeframe */
-  nativeSpotCandles?: Candle[];
-}
-
-export const DEFAULT_BASIS_EMA_ALPHA = 0.15;
-export const DEFAULT_MAX_BASIS_ABS_USD = 35;
-export const HIGH_BASIS_DIVERGENCE_THRESHOLD_USD = 6.0;
-
-/**
- * Pure exponential rolling basis update step (alpha = 0.15, clamped to +/-$35.00).
- */
-export function updateRollingBasisEma(
-  prevBasisUsd: number | null,
-  rawBasisUsd: number,
-  alpha = DEFAULT_BASIS_EMA_ALPHA,
-  maxBasisAbsUsd = DEFAULT_MAX_BASIS_ABS_USD,
-  highDivergenceThresholdUsd = HIGH_BASIS_DIVERGENCE_THRESHOLD_USD
-): { basisUsd: number; rawClampedUsd: number; highBasisDivergence: boolean } {
-  const safeAlpha = clamp(Number.isFinite(alpha) ? alpha : DEFAULT_BASIS_EMA_ALPHA, 0.01, 1.0);
-  const safeMax = Math.max(1, Number.isFinite(maxBasisAbsUsd) ? maxBasisAbsUsd : DEFAULT_MAX_BASIS_ABS_USD);
-  const rawClamped = Number.isFinite(rawBasisUsd) ? clamp(rawBasisUsd, -safeMax, safeMax) : 0;
-  const next =
-    prevBasisUsd !== null && Number.isFinite(prevBasisUsd)
-      ? clamp(safeAlpha * rawClamped + (1 - safeAlpha) * clamp(prevBasisUsd, -safeMax, safeMax), -safeMax, safeMax)
-      : rawClamped;
-  const basisUsd = round2(next);
-  const highBasisDivergence =
-    Math.abs(basisUsd) > highDivergenceThresholdUsd || Math.abs(rawClamped) > highDivergenceThresholdUsd;
-  return {
-    basisUsd,
-    rawClampedUsd: round2(rawClamped),
-    highBasisDivergence,
-  };
-}
-
-/**
- * Aggregates raw native Interbank XAU/USD spot ticks (e.g. Swissquote BBO) into timeframe OHLCV candles.
- */
-export function aggregateSpotTicksToCandles(
-  ticks: SpotTickSample[],
-  timeframe: Timeframe,
-  maxBars = 300
-): CalibratedCandle[] {
-  if (ticks.length === 0) return [];
-  const stepSec = TIMEFRAME_SECONDS[timeframe];
-  const sorted = [...ticks]
-    .filter((t) => Number.isFinite(t.timeSec) && Number.isFinite(t.price) && t.price > 0)
-    .sort((a, b) => a.timeSec - b.timeSec);
-
-  const buckets = new Map<number, CalibratedCandle>();
-  for (const tick of sorted) {
-    const bucketTime = Math.floor(tick.timeSec / stepSec) * stepSec;
-    const price = round2(tick.price);
-    const vol = Math.max(1, Math.round(Number.isFinite(tick.volume ?? 1) ? (tick.volume ?? 1) : 1));
-    const existing = buckets.get(bucketTime);
-    if (!existing) {
-      buckets.set(bucketTime, {
-        time: bucketTime,
-        open: price,
-        high: price,
-        low: price,
-        close: price,
-        volume: vol,
-        highBasisDivergence: false,
-        appliedBasisOffsetUsd: 0,
-      });
-    } else {
-      existing.high = round2(Math.max(existing.high, price));
-      existing.low = round2(Math.min(existing.low, price));
-      existing.close = price;
-      existing.volume += vol;
-    }
-  }
-
-  return Array.from(buckets.values())
-    .sort((a, b) => a.time - b.time)
-    .slice(-maxBars);
-}
-
-/**
- * Blends native Interbank Spot aggregated candles onto calibrated proxy candles for overlapping timestamps,
- * preserving smooth wick continuity without synthetic offset distortion.
- */
-export function mergeNativeSpotCandles(
-  calibratedProxy: CalibratedCandle[],
-  nativeSpot: Candle[],
-  maxBars = 300
-): CalibratedCandle[] {
-  if (nativeSpot.length === 0) return calibratedProxy.slice(-maxBars);
-  if (calibratedProxy.length === 0) {
-    return nativeSpot.slice(-maxBars).map((c) => ({
-      ...c,
-      highBasisDivergence: false,
-      appliedBasisOffsetUsd: 0,
-    }));
-  }
-
-  const merged = new Map<number, CalibratedCandle>();
-  for (const c of calibratedProxy) {
-    merged.set(c.time, { ...c });
-  }
-
-  for (const native of nativeSpot) {
-    if (!Number.isFinite(native.time) || !Number.isFinite(native.close) || native.close <= 0) continue;
-    const t = Math.floor(native.time);
-    const existing = merged.get(t);
-    if (existing && native.volume >= 2) {
-      // Blend native interbank extremes with calibrated proxy open for clean tick-level wick fidelity
-      const open = round2(existing.open);
-      const close = round2(native.close);
-      const high = round2(Math.max(open, close, native.high));
-      const low = round2(Math.min(open, close, native.low));
-      merged.set(t, {
-        ...existing,
-        open,
-        high,
-        low,
-        close,
-        volume: Math.max(existing.volume, native.volume),
-        highBasisDivergence: existing.highBasisDivergence ?? false,
-      });
-    } else if (!existing && t > calibratedProxy[calibratedProxy.length - 1].time) {
-      const o = round2(native.open);
-      const c = round2(native.close);
-      merged.set(t, {
-        time: t,
-        open: o,
-        high: round2(Math.max(o, c, native.high)),
-        low: round2(Math.min(o, c, native.low)),
-        close: c,
-        volume: Math.max(1, Math.round(native.volume)),
-        highBasisDivergence: false,
-        appliedBasisOffsetUsd: 0,
-      });
-    }
-  }
-
-  return Array.from(merged.values())
-    .sort((a, b) => a.time - b.time)
-    .slice(-maxBars);
-}
-
-function resolveObservedBasisAtTime(
-  timeSec: number,
-  sortedHistory: BasisObservation[],
-  fallbackBasis: number
-): number {
-  if (sortedHistory.length === 0) return fallbackBasis;
-  if (timeSec <= sortedHistory[0].time) return sortedHistory[0].basisUsd;
-  const last = sortedHistory[sortedHistory.length - 1];
-  if (timeSec >= last.time) return last.basisUsd;
-
-  // Binary search for bracketing basis observations and linearly interpolate
-  let lo = 0;
-  let hi = sortedHistory.length - 1;
-  while (lo + 1 < hi) {
-    const mid = (lo + hi) >> 1;
-    if (sortedHistory[mid].time <= timeSec) lo = mid;
-    else hi = mid;
-  }
-  const left = sortedHistory[lo];
-  const right = sortedHistory[hi];
-  const dt = Math.max(1, right.time - left.time);
-  const weight = clamp((timeSec - left.time) / dt, 0, 1);
-  return left.basisUsd + (right.basisUsd - left.basisUsd) * weight;
-}
-
 /**
  * Calibrates proxy gold OHLCV candles (e.g. Binance PAXGUSDT or OKX XAUT-USDT) onto
- * Interbank XAU/USD Spot (Swissquote) using an Exponential Rolling Basis Calibrator
- * (alpha = 0.15, clamped to +/-$35.00), optional native spot candles, and strict OHLC invariants.
- * Any bar whose effective or observed basis divergence exceeds $6.00 is flagged `highBasisDivergence: true`.
+ * Interbank XAU/USD Spot using a clamped basis offset while strictly enforcing OHLC invariants.
  */
 export function calibrateCandlesToSpot(
   candles: Candle[],
   basisOffsetUsd: number,
   liveSpot?: number | null,
-  maxBasisAbsUsdOrOptions: number | SpotCalibrationOptions = DEFAULT_MAX_BASIS_ABS_USD
-): CalibratedCandle[] {
+  maxBasisAbsUsd = 35
+): Candle[] {
   if (candles.length === 0) return [];
-
-  const opts: SpotCalibrationOptions =
-    typeof maxBasisAbsUsdOrOptions === 'number'
-      ? { maxBasisAbsUsd: maxBasisAbsUsdOrOptions }
-      : (maxBasisAbsUsdOrOptions ?? {});
-
-  const alpha = clamp(
-    Number.isFinite(opts.alpha ?? DEFAULT_BASIS_EMA_ALPHA) ? (opts.alpha ?? DEFAULT_BASIS_EMA_ALPHA) : DEFAULT_BASIS_EMA_ALPHA,
-    0.01,
-    1.0
-  );
-  const maxBasisAbsUsd = Math.max(
-    1,
-    Number.isFinite(opts.maxBasisAbsUsd ?? DEFAULT_MAX_BASIS_ABS_USD)
-      ? (opts.maxBasisAbsUsd ?? DEFAULT_MAX_BASIS_ABS_USD)
-      : DEFAULT_MAX_BASIS_ABS_USD
-  );
-  const highDivThreshold = Math.max(
-    0.5,
-    Number.isFinite(opts.highDivergenceThresholdUsd ?? HIGH_BASIS_DIVERGENCE_THRESHOLD_USD)
-      ? (opts.highDivergenceThresholdUsd ?? HIGH_BASIS_DIVERGENCE_THRESHOLD_USD)
-      : HIGH_BASIS_DIVERGENCE_THRESHOLD_USD
-  );
-
-  const safeTargetOffset = Number.isFinite(basisOffsetUsd)
+  const safeOffset = Number.isFinite(basisOffsetUsd)
     ? clamp(basisOffsetUsd, -maxBasisAbsUsd, maxBasisAbsUsd)
     : 0;
 
-  // Deduplicate and sort raw bars chronologically before rolling calibration
-  const rawByTime = new Map<number, Candle>();
+  // Sort chronologically & deduplicate timestamps
+  const byTime = new Map<number, Candle>();
   for (const raw of candles) {
     if (!Number.isFinite(raw.time) || !Number.isFinite(raw.close) || raw.close <= 0) continue;
-    rawByTime.set(Math.floor(raw.time), {
+    const o = round2(Math.max(0.01, raw.open + safeOffset));
+    const c = round2(Math.max(0.01, raw.close + safeOffset));
+    const h = round2(Math.max(o, c, raw.high + safeOffset));
+    const l = round2(Math.min(o, c, Math.max(0.01, raw.low + safeOffset)));
+    byTime.set(Math.floor(raw.time), {
       time: Math.floor(raw.time),
-      open: raw.open,
-      high: raw.high,
-      low: raw.low,
-      close: raw.close,
-      volume: Math.max(0, Math.round(Number.isFinite(raw.volume) ? raw.volume : 0)),
-    });
-  }
-  const sortedRaw = Array.from(rawByTime.values()).sort((a, b) => a.time - b.time);
-  if (sortedRaw.length === 0) return [];
-
-  const sortedHistory = [...(opts.basisHistory ?? [])]
-    .filter((b) => Number.isFinite(b.time) && Number.isFinite(b.basisUsd))
-    .sort((a, b) => a.time - b.time);
-
-  const nativeByTime = new Map<number, Candle>();
-  for (const nc of opts.nativeSpotCandles ?? []) {
-    if (Number.isFinite(nc.time) && Number.isFinite(nc.close) && nc.close > 0) {
-      nativeByTime.set(Math.floor(nc.time), nc);
-    }
-  }
-
-  let emaBasis: number | null =
-    typeof opts.initialBasisUsd === 'number' && Number.isFinite(opts.initialBasisUsd)
-      ? clamp(opts.initialBasisUsd, -maxBasisAbsUsd, maxBasisAbsUsd)
-      : null;
-
-  const out: CalibratedCandle[] = [];
-
-  for (let i = 0; i < sortedRaw.length; i++) {
-    const raw = sortedRaw[i];
-    const nativeMatch = nativeByTime.get(raw.time);
-
-    let observedBasis = safeTargetOffset;
-    if (nativeMatch && nativeMatch.close > 0) {
-      observedBasis = clamp(nativeMatch.close - raw.close, -maxBasisAbsUsd, maxBasisAbsUsd);
-    } else if (sortedHistory.length > 0) {
-      observedBasis = clamp(
-        resolveObservedBasisAtTime(raw.time, sortedHistory, safeTargetOffset),
-        -maxBasisAbsUsd,
-        maxBasisAbsUsd
-      );
-    }
-
-    const stepped = updateRollingBasisEma(emaBasis, observedBasis, alpha, maxBasisAbsUsd, highDivThreshold);
-    emaBasis = stepped.basisUsd;
-
-    const appliedOffset = stepped.basisUsd;
-    const o = round2(Math.max(0.01, raw.open + appliedOffset));
-    const c = round2(Math.max(0.01, raw.close + appliedOffset));
-    const h = round2(Math.max(o, c, raw.high + appliedOffset));
-    const l = round2(Math.min(o, c, Math.max(0.01, raw.low + appliedOffset)));
-
-    const isHighDiv =
-      stepped.highBasisDivergence ||
-      Math.abs(appliedOffset) > highDivThreshold ||
-      Math.abs(observedBasis) > highDivThreshold;
-
-    out.push({
-      time: raw.time,
       open: o,
       high: h,
       low: l,
       close: c,
-      volume: raw.volume,
-      appliedBasisOffsetUsd: appliedOffset,
-      ...(isHighDiv ? { highBasisDivergence: true } : { highBasisDivergence: false }),
+      volume: Math.max(0, Math.round(Number.isFinite(raw.volume) ? raw.volume : 0)),
     });
   }
 
-  // Align the live forming bar close tightly to liveSpot if within clamped ceiling
+  const out = Array.from(byTime.values()).sort((a, b) => a.time - b.time);
+
+  // Align the live forming bar close tightly to liveSpot if within reasonable divergence
   if (out.length > 0 && typeof liveSpot === 'number' && Number.isFinite(liveSpot) && liveSpot > 0) {
-    const lastIdx = out.length - 1;
-    const last = out[lastIdx];
-    const lastRaw = sortedRaw[lastIdx];
-    const liveBasisDiff = Math.abs(liveSpot - lastRaw.close);
+    const last = out[out.length - 1];
     if (Math.abs(liveSpot - last.close) <= maxBasisAbsUsd) {
       const spotR = round2(liveSpot);
-      const flagged = Boolean(last.highBasisDivergence) || liveBasisDiff > highDivThreshold;
-      out[lastIdx] = {
+      out[out.length - 1] = {
         ...last,
         close: spotR,
         high: round2(Math.max(last.high, spotR)),
         low: round2(Math.min(last.low, spotR)),
-        appliedBasisOffsetUsd: round2(clamp(liveSpot - lastRaw.close, -maxBasisAbsUsd, maxBasisAbsUsd)),
-        highBasisDivergence: flagged,
-      };
-    } else if (liveBasisDiff > highDivThreshold) {
-      out[lastIdx] = {
-        ...last,
-        highBasisDivergence: true,
       };
     }
   }
 
-  return opts.nativeSpotCandles && opts.nativeSpotCandles.length > 0
-    ? mergeNativeSpotCandles(out, opts.nativeSpotCandles, Math.max(300, out.length))
-    : out;
+  return out;
 }
 
 /**
