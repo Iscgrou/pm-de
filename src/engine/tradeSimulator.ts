@@ -6,6 +6,7 @@ import type {
   ConfirmedPosition,
   NewsGateStatus,
   OrderExecutionType,
+  PositionCoPilotDirective,
   QuantSnapshot,
   SimAccountMetrics,
   SimAccountState,
@@ -156,7 +157,10 @@ export interface OpenSimulatedTradeInput {
   proposal: AgentProposal;
   lotSize: number;
   executionType: OrderExecutionType;
+  /** User-entered exact fill price from their external broker (MT4/MT5/cTrader) */
+  actualFillPrice?: number;
   trailingStopDistance?: number | null;
+  autoScaleOutTp1Pct?: number;
   tick: Tick;
   quant: QuantSnapshot;
   newsGate: NewsGateStatus;
@@ -173,20 +177,146 @@ export interface OpenSimulatedTradeResult {
   account: SimAccountState;
 }
 
+export interface PositionDirectiveSnapshot {
+  latestDirective: PositionCoPilotDirective;
+  recommendedActionPrice: number;
+  recommendedScaleOutPct?: number;
+  directiveUrgency: 'NORMAL' | 'HIGH' | 'CRITICAL';
+  directiveRationaleFa: string;
+  directiveRationaleEn: string;
+}
+
 /**
- * Simulates full institutional broker trade confirmation:
+ * Deterministic System-1/Co-Pilot position guardian:
+ * Derives an exact, copyable manual-broker directive (HOLD_STEADY, MOVE_SL_TO_BREAKEVEN,
+ * PARTIAL_TAKE_PROFIT_TP1, TRAIL_STOP_STRUCTURAL, or EMERGENCY_EXIT_NOW) from live price,
+ * structural geometry, HSM progress, USD news gate, and PAXG basis divergence.
+ */
+export function derivePositionCoPilotDirective(
+  pos: ConfirmedPosition,
+  markPrice: number,
+  quant: QuantSnapshot,
+  newsGate: NewsGateStatus,
+  basis: BasisDivergence,
+  autoScaleOutTp1Pct = 50
+): PositionDirectiveSnapshot {
+  const isLong = pos.direction === 'LONG';
+  const clampedScalePct = Math.round(Math.max(10, Math.min(90, autoScaleOutTp1Pct)));
+
+  if (pos.status === 'PENDING_LIMIT') {
+    const distUsd = round2(Math.abs(markPrice - pos.entry));
+    return {
+      latestDirective: 'HOLD_STEADY',
+      recommendedActionPrice: round2(pos.entry),
+      directiveUrgency: newsGate.state === 'LOCKOUT' ? 'CRITICAL' : 'NORMAL',
+      directiveRationaleEn:
+        newsGate.state === 'LOCKOUT'
+          ? `USD News LOCKOUT (${newsGate.activeEvent?.title ?? 'High Impact'}) — cancel resting broker limit @ $${pos.entry.toFixed(2)} until volatility settles.`
+          : `Pending ${pos.direction} Limit tracked at $${pos.entry.toFixed(2)} ($${distUsd.toFixed(2)} away). Wait for clean entry zone fill; keep structural SL $${pos.stopLoss.toFixed(2)}.`,
+      directiveRationaleFa:
+        newsGate.state === 'LOCKOUT'
+          ? `قفل خبر قرمز دلار فعال است — سفارش لیمیت در $${pos.entry.toFixed(2)} را تا پایان نوسان خبری در بروکر لغو کنید.`
+          : `سفارش لیمیت ${pos.direction} در $${pos.entry.toFixed(2)} (فاصله $${distUsd.toFixed(2)}) زیر نظر است. منتظر پر شدن دقیق با SL ساختاری $${pos.stopLoss.toFixed(2)} بمانید.`,
+    };
+  }
+
+  const spreadBuffer = Math.max(pos.spread || 0.2, 0.15);
+  const beSl = round2(isLong ? pos.entry + spreadBuffer : pos.entry - spreadBuffer);
+  const isRiskFree = isLong ? pos.stopLoss >= beSl - 0.05 : pos.stopLoss <= beSl + 0.05;
+  const tp1Dist = Math.max(0.1, Math.abs(pos.tp1 - pos.entry));
+  const favorableMove = isLong ? markPrice - pos.entry : pos.entry - markPrice;
+  const tp1Progress = favorableMove / tp1Dist;
+
+  // 1. CRITICAL: Emergency Exit when unhedged against Red News Lockout, emergency shock, or structural breakdown
+  const newsEmergency = newsGate.state === 'LOCKOUT' && !isRiskFree;
+  const inducementDanger = basis.cryptoInducementWarning && pos.rMultiple < -0.35;
+  const structuralExit = pos.actionTag === 'EXIT_WARNING' || (pos.urgency === 'CRITICAL' && !isRiskFree);
+  if (newsEmergency || inducementDanger || structuralExit) {
+    return {
+      latestDirective: 'EMERGENCY_EXIT_NOW',
+      recommendedActionPrice: round2(markPrice),
+      directiveUrgency: 'CRITICAL',
+      directiveRationaleEn: newsEmergency
+        ? `High-Impact USD News LOCKOUT (${newsGate.activeEvent?.title ?? 'Macro Release'}) while SL is exposed at $${pos.stopLoss.toFixed(2)}. Close immediately in broker near $${markPrice.toFixed(2)} to avoid slippage gap.`
+        : inducementDanger
+          ? `PAXG Crypto Inducement divergence ($${basis.basisUsd.toFixed(2)}) with adverse move (${pos.rMultiple.toFixed(2)}R). Exit manually near $${markPrice.toFixed(2)}.`
+          : pos.adviceEn || `Adverse structural shift detected (${pos.rMultiple.toFixed(2)}R). Close position in broker near $${markPrice.toFixed(2)} to preserve capital.`,
+      directiveRationaleFa: newsEmergency
+        ? `قفل خبر قرمز دلار فعال است و حد ضرر هنوز ریسک‌فری نشده! برای جلوگیری از اسلیپیج شدید، همین الان حوالی $${markPrice.toFixed(2)} در بروکر ببندید.`
+        : inducementDanger
+          ? `واگرایی شدید PAXG (${basis.basisUsd.toFixed(2)}$) همراه با حرکت خلاف جهت (${pos.rMultiple.toFixed(2)}R). حوالی $${markPrice.toFixed(2)} خروج اضطراری بزنید.`
+          : pos.adviceFa || `تغییر ساختار خلاف جهت پوزیشن (${pos.rMultiple.toFixed(2)}R). برای حفظ سرمایه، حوالی $${markPrice.toFixed(2)} در بروکر خارج شوید.`,
+    };
+  }
+
+  // 2. HIGH: Partial Take-Profit at TP1
+  if (!pos.realizedPartial && (tp1Progress >= 0.92 || pos.actionTag === 'SCALE_PARTIAL')) {
+    return {
+      latestDirective: 'PARTIAL_TAKE_PROFIT_TP1',
+      recommendedActionPrice: round2(pos.tp1),
+      recommendedScaleOutPct: clampedScalePct,
+      directiveUrgency: 'HIGH',
+      directiveRationaleEn: `Price reached TP1 zone ($${pos.tp1.toFixed(2)} · +${pos.rMultiple.toFixed(2)}R). Scale out ${clampedScalePct}% in your broker and move remaining SL to Break-Even $${beSl.toFixed(2)}.`,
+      directiveRationaleFa: `قیمت به محدوده TP1 ($${pos.tp1.toFixed(2)} · +${pos.rMultiple.toFixed(2)}R) رسید. ${clampedScalePct}٪ حجم را در بروکر سیو سود کنید و SL باقیمانده را به نقطه سر‌به‌سر $${beSl.toFixed(2)} بیاورید.`,
+    };
+  }
+
+  // 3. HIGH: Move SL to Break-Even once >= 50% of TP1 or >= 0.85R achieved
+  if (!isRiskFree && (tp1Progress >= 0.5 || pos.rMultiple >= 0.85 || pos.stage === 'BREAK_EVEN_ARMED' || pos.actionTag === 'ARM_BE' || pos.actionTag === 'MOVE_SL_RF')) {
+    return {
+      latestDirective: 'MOVE_SL_TO_BREAKEVEN',
+      recommendedActionPrice: beSl,
+      directiveUrgency: 'HIGH',
+      directiveRationaleEn: `Trade reached ${(tp1Progress * 100).toFixed(0)}% toward TP1 (+${pos.rMultiple.toFixed(2)}R). Move broker SL from $${pos.stopLoss.toFixed(2)} to Break-Even $${beSl.toFixed(2)} (entry ± spread) to eliminate downside risk.`,
+      directiveRationaleFa: `معامله به ${(tp1Progress * 100).toFixed(0)}٪ مسیر TP1 (+${pos.rMultiple.toFixed(2)}R) رسید. حد ضرر بروکر را از $${pos.stopLoss.toFixed(2)} به نقطه ریسک‌فری $${beSl.toFixed(2)} منتقل کنید.`,
+    };
+  }
+
+  // 4. HIGH/NORMAL: Trail SL Behind Structural Swing once Risk-Free and runner extends
+  if (isRiskFree && (pos.realizedPartial || pos.rMultiple >= 1.35)) {
+    const atrTrailDist = Math.max(1.8, quant.regime.atr * 0.9);
+    const candidateTrail = round2(isLong ? markPrice - atrTrailDist : markPrice + atrTrailDist);
+    const improves = isLong ? candidateTrail > pos.stopLoss + 0.5 && candidateTrail < markPrice - 0.35 : candidateTrail < pos.stopLoss - 0.5 && candidateTrail > markPrice + 0.35;
+    if (improves) {
+      return {
+        latestDirective: 'TRAIL_STOP_STRUCTURAL',
+        recommendedActionPrice: candidateTrail,
+        directiveUrgency: 'HIGH',
+        directiveRationaleEn: `Runner is risk-free at +${pos.rMultiple.toFixed(2)}R toward TP2 ($${pos.tp2.toFixed(2)}). Trail broker SL behind recent M5 swing / 0.9×ATR to $${candidateTrail.toFixed(2)} to lock profit.`,
+        directiveRationaleFa: `بخش رانر در سود +${pos.rMultiple.toFixed(2)}R به سمت TP2 ($${pos.tp2.toFixed(2)}) در حرکت است. حد ضرر را پشت سوئینگ ساختاری M5 در $${candidateTrail.toFixed(2)} تریل کنید.`,
+      };
+    }
+  }
+
+  // 5. NORMAL: Hold Steady
+  return {
+    latestDirective: 'HOLD_STEADY',
+    recommendedActionPrice: round2(pos.stopLoss),
+    directiveUrgency: 'NORMAL',
+    directiveRationaleEn:
+      pos.adviceEn ||
+      `Structure intact (${pos.rMultiple >= 0 ? '+' : ''}${pos.rMultiple.toFixed(2)}R). Hold steady with structural SL $${pos.stopLoss.toFixed(2)} and TP1 target $${pos.tp1.toFixed(2)}.`,
+    directiveRationaleFa:
+      pos.adviceFa ||
+      `ساختار معاملاتی معتبر است (${pos.rMultiple >= 0 ? '+' : ''}${pos.rMultiple.toFixed(2)}R). با حفظ SL ساختاری $${pos.stopLoss.toFixed(2)} و هدف TP1 در $${pos.tp1.toFixed(2)} پوزیشن را نگه دارید.`,
+  };
+}
+
+/**
+ * Simulates / registers manual broker trade confirmation:
  * - Enforces USD News Lockout & Caution 50% lot cap
- * - Calculates realistic Ask/Bid + slippage fill (Market) or resting order (Limit)
- * - Shifts SL/TP geometry cleanly around Market fill if spot moved since proposal creation
- * - Enforces System 1 R:R >= 1.50 & 0.25*ATR guardrails
- * - Validates Free Margin availability and deducts opening half of ECN round-turn commission
+ * - Uses exact user-entered broker fill price (when provided) or realistic Ask/Bid + slippage fill (Market) or resting order (Limit)
+ * - NEVER shifts structural SL/TP1/TP2 by fill slippage — keeps ICT invalidation wick & liquidity targets strictly anchored
+ * - Enforces System 1 structural geometry & margin availability
  */
 export function simulateOpenTrade(input: OpenSimulatedTradeInput): OpenSimulatedTradeResult {
   const {
     proposal,
     lotSize,
     executionType,
+    actualFillPrice,
     trailingStopDistance = null,
+    autoScaleOutTp1Pct = 50,
     tick,
     quant,
     newsGate,
@@ -209,7 +339,10 @@ export function simulateOpenTrade(input: OpenSimulatedTradeInput): OpenSimulated
   const isLong = proposal.direction === 'LONG';
   const atr = Math.max(2.0, quant.regime.atr);
 
-  const { fillPrice, slippageUsd } = calculateExecutionFill(
+  const hasCustomFill =
+    executionType === 'MARKET' && typeof actualFillPrice === 'number' && Number.isFinite(actualFillPrice) && actualFillPrice > 0;
+
+  const computedFill = calculateExecutionFill(
     proposal.direction,
     tick,
     executionType,
@@ -218,34 +351,55 @@ export function simulateOpenTrade(input: OpenSimulatedTradeInput): OpenSimulated
     atr
   );
 
-  // Preserve original proposal stop/target distances anchored to actual Market fill price
-  // so small live price drift never breaks geometry on immediate market execution.
-  const origSlDist = Math.abs(proposal.entry - proposal.stopLoss);
-  const origTp1Dist = Math.abs(proposal.tp1 - proposal.entry);
-  const origTp2Dist = Math.abs(proposal.tp2 - proposal.entry);
+  const entryPrice = hasCustomFill
+    ? round2(actualFillPrice)
+    : executionType === 'MARKET'
+      ? computedFill.fillPrice
+      : round2(proposal.entry);
 
-  const entryPrice = executionType === 'MARKET' ? fillPrice : round2(proposal.entry);
-  const stopLoss =
-    executionType === 'MARKET'
-      ? round2(isLong ? entryPrice - origSlDist : entryPrice + origSlDist)
-      : round2(proposal.stopLoss);
-  const tp1 =
-    executionType === 'MARKET'
-      ? round2(isLong ? entryPrice + origTp1Dist : entryPrice - origTp1Dist)
-      : round2(proposal.tp1);
-  const tp2 =
-    executionType === 'MARKET'
-      ? round2(isLong ? entryPrice + origTp2Dist : entryPrice - origTp2Dist)
-      : round2(proposal.tp2);
+  const slippageUsd = hasCustomFill
+    ? round2(Math.abs(entryPrice - proposal.entry))
+    : computedFill.slippageUsd;
 
-  const guard = validateTradeGuardrails(proposal.direction, entryPrice, stopLoss, tp1, tp2, atr);
-  if (!guard.valid) {
-    return {
-      ok: false,
-      errors: guard.errors,
-      position: null,
-      account,
-    };
+  // ZERO GEOMETRY SHIFT: Structural SL, TP1, and TP2 remain strictly anchored
+  // to the chart's ICT invalidation wick and liquidity targets.
+  const stopLoss = round2(proposal.stopLoss);
+  const tp1 = round2(proposal.tp1);
+  const tp2 = round2(proposal.tp2);
+
+  let effectiveRrRatio: number;
+  if (hasCustomFill) {
+    // When tracking an already-opened manual broker fill, enforce strict structural ordering
+    // (SL < Entry < TP1 < TP2 for LONG, SL > Entry > TP1 > TP2 for SHORT) without blocking
+    // if fill slippage slightly reduced R:R below 1.50 (UI warns explicitly about slippage R:R).
+    const geomValid = isLong
+      ? stopLoss < entryPrice && entryPrice < tp1 && tp1 < tp2
+      : stopLoss > entryPrice && entryPrice > tp1 && tp1 > tp2;
+    if (!geomValid) {
+      return {
+        ok: false,
+        errors: [
+          isLong
+            ? `قیمت ورود واقعی ($${entryPrice.toFixed(2)}) باید بین حد ضرر ساختاری ($${stopLoss.toFixed(2)}) و هدف اول ($${tp1.toFixed(2)}) باشد.`
+            : `قیمت ورود واقعی ($${entryPrice.toFixed(2)}) باید بین هدف اول ($${tp1.toFixed(2)}) و حد ضرر ساختاری ($${stopLoss.toFixed(2)}) باشد.`,
+        ],
+        position: null,
+        account,
+      };
+    }
+    const stopDist = Math.max(0.01, Math.abs(entryPrice - stopLoss));
+    effectiveRrRatio = round2(Math.abs(tp1 - entryPrice) / stopDist);
+  } else {
+    const guard = validateTradeGuardrails(proposal.direction, entryPrice, stopLoss, tp1, tp2, atr);
+    if (!guard.valid) {
+      return {
+        ok: false,
+        errors: guard.errors,
+        position: null,
+        account,
+      };
+    }
+    effectiveRrRatio = guard.rrRatio;
   }
 
   const requiredMargin = calculateRequiredMargin(entryPrice, adjustedLot, account.leverage);
@@ -314,7 +468,7 @@ export function simulateOpenTrade(input: OpenSimulatedTradeInput): OpenSimulated
     lotSize: adjustedLot,
     spread: tick.spread,
     stage: 'OPEN',
-    rrRatio: guard.rrRatio,
+    rrRatio: effectiveRrRatio,
     unrealizedPnl: initialNetPnl,
     grossPnl: initialGrossPnl,
     netPnl: initialNetPnl,
@@ -347,7 +501,7 @@ export function simulateOpenTrade(input: OpenSimulatedTradeInput): OpenSimulated
     lastReviewedMs: nowMs,
   };
 
-  const evaluated =
+  const preEvaluated: ConfirmedPosition =
     status === 'ACTIVE'
       ? {
           ...evaluateConfirmedPositionAdvice(basePos, markPrice, quant, newsGate, basis),
@@ -359,9 +513,22 @@ export function simulateOpenTrade(input: OpenSimulatedTradeInput): OpenSimulated
         }
       : {
           ...basePos,
-          adviceEn: `Resting ${proposal.direction} Limit armed at ${entryPrice.toFixed(2)} (${adjustedLot.toFixed(2)} lot). Will auto-fill when live ${isLong ? 'Ask' : 'Bid'} reaches entry.`,
+          adviceEn: `Resting ${proposal.direction} Limit armed at ${entryPrice.toFixed(2)} (${adjustedLot.toFixed(2)} lot). Will alert & activate when live ${isLong ? 'Ask' : 'Bid'} reaches entry.`,
           adviceFa: `سفارش لیمیت ${proposal.direction} در نرخ ${entryPrice.toFixed(2)} ثبت شد و به محض برخورد قیمت به صورت خودکار فعال می‌شود.`,
         };
+
+  const directive = derivePositionCoPilotDirective(
+    preEvaluated,
+    markPrice,
+    quant,
+    newsGate,
+    basis,
+    autoScaleOutTp1Pct
+  );
+  const evaluated: ConfirmedPosition = {
+    ...preEvaluated,
+    ...directive,
+  };
 
   const updatedAccountBase: SimAccountState = {
     ...account,
@@ -403,8 +570,11 @@ export function stepSimulatedPositions(
   quant: QuantSnapshot,
   newsGate: NewsGateStatus,
   basis: BasisDivergence,
-  nowMs = Date.now()
+  nowMs = Date.now(),
+  autoScaleOutTp1Pct = 50
 ): StepSimulationResult {
+  const clampedScaleOutPct = Math.max(10, Math.min(90, autoScaleOutTp1Pct));
+  const scaleOutFraction = clampedScaleOutPct / 100;
   let workingAccount: SimAccountState = { ...account };
   const surviving: ConfirmedPosition[] = [];
   const newClosedTrades: ClosedTradeRecord[] = [];
@@ -422,7 +592,16 @@ export function stepSimulatedPositions(
     if (pos.status === 'PENDING_LIMIT') {
       const triggered = isLong ? tick.ask <= pos.entry : tick.bid >= pos.entry;
       if (!triggered) {
-        surviving.push(pos);
+        const pendingMark = isLong ? tick.ask : tick.bid;
+        const pendingDir = derivePositionCoPilotDirective(
+          pos,
+          pendingMark,
+          quant,
+          newsGate,
+          basis,
+          clampedScaleOutPct
+        );
+        surviving.push({ ...pos, ...pendingDir });
         continue;
       }
 
@@ -552,10 +731,10 @@ export function stepSimulatedPositions(
       continue;
     }
 
-    // 6. TP1 Auto 50% Partial Scale-Out + Risk-Free Break-Even Lock
+    // 6. TP1 Auto Partial Scale-Out (driven by agentConfig.autoScaleOutTp1Pct / 100) + Risk-Free Break-Even Lock
     const tp1Hit = !pos.realizedPartial && ((isLong && markPrice >= pos.tp1) || (!isLong && markPrice <= pos.tp1));
     if (tp1Hit) {
-      const partialLot = round2(Math.max(0.01, pos.lotSize * 0.5));
+      const partialLot = round2(Math.max(0.01, pos.lotSize * scaleOutFraction));
       const remainingLot = round2(Math.max(0.01, pos.lotSize - partialLot));
       const exitPrice = round2(pos.tp1);
       const partialGross = round2((isLong ? exitPrice - pos.entry : pos.entry - exitPrice) * partialLot * GOLD_CONTRACT_OZ);
@@ -569,7 +748,7 @@ export function stepSimulatedPositions(
         id: `trd-p1-${nowMs.toString(36)}-${pos.id.slice(-3)}`,
         orderId: pos.orderId,
         proposalId: pos.proposalId,
-        setupType: `${pos.setupType} (۵۰٪ TP1)`,
+        setupType: `${pos.setupType} (${Math.round(clampedScaleOutPct)}% TP1)`,
         direction: pos.direction,
         timeframe: pos.timeframe,
         lotSize: partialLot,
@@ -597,7 +776,7 @@ export function stepSimulatedPositions(
       pos.executionLog.push(
         makeEvent(
           'PARTIAL_TP1',
-          `لمس TP1 در $${exitPrice.toFixed(2)}: سیو ۵۰٪ حجم (${partialLot.toFixed(2)} لات) با سود +$${partialNet.toFixed(2)}`,
+          `لمس TP1 در $${exitPrice.toFixed(2)}: سیو ${Math.round(clampedScaleOutPct)}٪ حجم (${partialLot.toFixed(2)} لات) با سود +$${partialNet.toFixed(2)}`,
           exitPrice,
           nowMs,
           partialNet
@@ -605,11 +784,11 @@ export function stepSimulatedPositions(
         makeEvent('BE_LOCK', `قفل ریسک‌فری SL در $${beSl.toFixed(2)} (ورود ± اسپرد)`, beSl, nowMs)
       );
       events.push(
-        `سیو سود ۵۰٪ در TP1 (${pos.orderId}): +$${partialNet.toFixed(2)} قطعی شد · SL در $${beSl.toFixed(2)} ریسک‌فری شد`
+        `سیو سود ${Math.round(clampedScaleOutPct)}٪ در TP1 (${pos.orderId}): +$${partialNet.toFixed(2)} قطعی شد · SL در $${beSl.toFixed(2)} ریسک‌فری شد`
       );
     }
 
-    // 7. Update live Gross/Net PnL, MFE/MAE & System 2 HSM/AI tactical advice
+    // 7. Update live Gross/Net PnL, MFE/MAE & System 2 HSM/AI tactical advice + Co-Pilot directive
     const grossPnl = round2(signedMove * pos.lotSize * GOLD_CONTRACT_OZ);
     const netPnl = round2(grossPnl - pos.swapAccrued);
     pos.grossPnl = grossPnl;
@@ -619,8 +798,18 @@ export function stepSimulatedPositions(
     pos.maeUsd = round2(Math.min(pos.maeUsd, grossPnl));
 
     const advised = evaluateConfirmedPositionAdvice(pos, markPrice, quant, newsGate, basis);
+    const directive = derivePositionCoPilotDirective(
+      advised,
+      markPrice,
+      quant,
+      newsGate,
+      basis,
+      clampedScaleOutPct
+    );
     surviving.push({
       ...advised,
+      ...directive,
+      thinkingTrace: original.thinkingTrace,
       grossPnl,
       netPnl,
       unrealizedPnl: netPnl,

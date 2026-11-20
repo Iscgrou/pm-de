@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import zlib from 'zlib';
 import { fileURLToPath } from 'url';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import { validateTradeGuardrails } from './src/engine/smcQuant.ts';
 import {
   CORE_GOLD_NEWS_SOURCES,
@@ -13,173 +14,59 @@ import {
 import type { CoreNewsSource, LiveNewsIntelligence, NewsEvent, ScoredNewsHeadline, Timeframe } from './src/engine/types.ts';
 import { chartStore } from './server/timescaleStore.ts';
 import { fetchAllTimeframesBundle, fetchCalibratedCandles } from './server/marketCandles.ts';
-import { aiProviderHub, type SubAgentId } from './server/aiProviderHub.ts';
-import { verifyProposalAgainstFactLedger } from './server/factLedger.ts';
-import {
-  subAgentOrchestrator,
-  type SubAgentTelemetryEvent,
-} from './server/subAgentOrchestrator.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const DEB_ROOT = path.resolve(__dirname, 'ubuntu-deb');
+
+function getGeminiClient(): GoogleGenAI | null {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') return null;
+  return new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
+    },
+  });
+}
 
 function isQuotaError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err ?? '');
   return msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.toLowerCase().includes('quota');
 }
 
-function isMissingKeyError(err: unknown): boolean {
-  const code = (err as { code?: string } | null)?.code;
-  const msg = err instanceof Error ? err.message : String(err ?? '');
-  return code === 'MISSING_API_KEY' || msg.includes('MISSING_API_KEY') || msg.includes('GEMINI_API_KEY is not configured');
-}
-
-// --- Native Mode D: Antigravity MCP Bridge Server State ---
-interface McpPendingJob {
-  job_id: string;
-  jobId: string;
-  kind: 'PROPOSAL' | 'ADVISORY' | 'SUB_AGENT';
-  subAgentId?: SubAgentId;
-  prompt: string;
-  systemInstruction: string;
-  createdAtMs: number;
-  expiresAtMs: number;
-}
-
-interface McpAuditEntry {
-  id: string;
-  timestampMs: number;
-  category: 'SCAN' | 'PROPOSAL' | 'STAND_DOWN' | 'CIRCUIT_BREAKER' | 'ADVISORY' | 'MCP_BRIDGE' | 'AI_CONFIG';
-  severity: 'INFO' | 'WARN' | 'CRITICAL';
-  title: string;
-  detail: string;
-}
-
-interface LiveSpotSnapshot {
-  live: boolean;
-  spot: { bid: number; ask: number; mid: number; spread: number; source: string; tier: 1 | 2 | 3 } | null;
-  paxg: { bid: number; ask: number; mid: number } | null;
-  basisUsd: number;
-  storageBackend: 'timescaledb' | 'memory';
-  timestampMs: number;
-  reason?: string;
-}
-
-const mcpPendingJobs: McpPendingJob[] = [];
-const mcpJobResolvers = new Map<
-  string,
-  { resolve: (text: string) => void; reject: (err: Error) => void; timer: NodeJS.Timeout }
->();
-const mcpProposals: Array<Record<string, unknown>> = [];
-const mcpAdvisories: Array<Record<string, unknown>> = [];
-const serverAuditLog: McpAuditEntry[] = [];
-let latestCircuitBreakers: Record<string, unknown> = {
-  canOpenNewTrades: true,
-  effectiveRiskMultiplier: 1.0,
-  consecutiveLosses: 0,
-  cooldownRemainingMin: 0,
-  dailyDrawdownPct: 0,
-  openPortfolioHeatPct: 0,
-  openPositionsCount: 0,
-  activeBreakers: [],
-  breakers: [],
-  summaryEn: 'Server risk circuit breakers nominal.',
-  summaryFa: 'فیوزهای مدیریت ریسک سرور در وضعیت عادی قرار دارند.',
-  updatedAtMs: Date.now(),
-};
-
-function recordServerAudit(
-  category: McpAuditEntry['category'],
-  severity: McpAuditEntry['severity'],
-  title: string,
-  detail: string
-): McpAuditEntry {
-  const entry: McpAuditEntry = {
-    id: `aud-srv-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
-    timestampMs: Date.now(),
-    category,
-    severity,
-    title,
-    detail,
-  };
-  serverAuditLog.unshift(entry);
-  if (serverAuditLog.length > 100) serverAuditLog.length = 100;
-  return entry;
-}
-
-function resolvePendingMcpJob(jobId: string | undefined, serializedPayload: string): boolean {
-  const targetId = jobId || mcpPendingJobs[0]?.jobId;
-  if (!targetId) return false;
-  const idx = mcpPendingJobs.findIndex((j) => j.jobId === targetId || j.job_id === targetId);
-  if (idx !== -1) {
-    mcpPendingJobs.splice(idx, 1);
-  }
-  const pending = mcpJobResolvers.get(targetId);
-  if (pending) {
-    clearTimeout(pending.timer);
-    mcpJobResolvers.delete(targetId);
-    pending.resolve(serializedPayload);
-    return true;
-  }
-  return false;
-}
-
-aiProviderHub.setMcpBridgeDispatcher(async ({ subAgentId, prompt, systemInstruction, timeoutMs }) => {
-  const jobId = `mcp-job-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-  const nowMs = Date.now();
-  const job: McpPendingJob = {
-    job_id: jobId,
-    jobId,
-    kind: 'SUB_AGENT',
-    subAgentId,
-    prompt,
-    systemInstruction,
-    createdAtMs: nowMs,
-    expiresAtMs: nowMs + timeoutMs,
-  };
-  mcpPendingJobs.push(job);
-  recordServerAudit('MCP_BRIDGE', 'INFO', `Queued MCP Job ${jobId}`, `Sub-agent=${subAgentId ?? 'general'}, timeout=${timeoutMs}ms`);
-
-  return await new Promise<string>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      const idx = mcpPendingJobs.findIndex((j) => j.jobId === jobId);
-      if (idx !== -1) mcpPendingJobs.splice(idx, 1);
-      mcpJobResolvers.delete(jobId);
-      reject(
-        new Error(
-          `ANTIGRAVITY_MCP_BRIDGE timeout after ${timeoutMs}ms waiting for external MCP client to answer job ${jobId} via /api/v1/agent/proposals or /api/v1/agent/submit-advisory.`
-        )
-      );
-    }, timeoutMs);
-    mcpJobResolvers.set(jobId, { resolve, reject, timer });
-  });
-});
-
-// Shared real-time SSE client registry & 1000ms spot snapshot cache
-const sseClients = new Set<express.Response>();
-let cachedLiveMarket: LiveSpotSnapshot | null = null;
-let cachedLiveMarketAtMs = 0;
-let liveMarketFetchInFlight: Promise<LiveSpotSnapshot> | null = null;
-
-function broadcastSseEvent(eventName: string, payload: unknown): void {
-  if (sseClients.size === 0) return;
-  const serialized = `event: ${eventName}\ndata: ${JSON.stringify(payload)}\n\n`;
-  for (const client of sseClients) {
-    try {
-      client.write(serialized);
-    } catch {
-      sseClients.delete(client);
-    }
+async function generateStructuredJson(
+  ai: GoogleGenAI,
+  contents: string,
+  responseSchema: Record<string, unknown>
+): Promise<string> {
+  try {
+    const response = await ai.models.generateContent({
+      model: 'gemini-4-hydrogen',
+      contents,
+      config: {
+        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        responseMimeType: 'application/json',
+        responseSchema,
+      },
+    });
+    return (response.text ?? '{}').trim();
+  } catch (primaryErr) {
+    if (!isQuotaError(primaryErr)) throw primaryErr;
+    // Fallback to gemini-2.5-flash when primary model free-tier quota is exhausted
+    const fallbackResp = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents,
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema,
+      },
+    });
+    return (fallbackResp.text ?? '{}').trim();
   }
 }
-
-subAgentOrchestrator.on('telemetry', (evt: SubAgentTelemetryEvent) => {
-  broadcastSseEvent('sub_agent_telemetry', evt);
-  if (evt.eventType === 'MACRO_CACHE_UPDATED') {
-    broadcastSseEvent('macro_brief', subAgentOrchestrator.getCachedMacroBrief());
-  }
-});
 
 interface DebFileEntry {
   path: string;
@@ -400,19 +287,63 @@ async function fetchCoreGoldNewsIntelligence(force = false): Promise<LiveNewsInt
   return intel;
 }
 
-async function pollLiveMarketSnapshot(force = false): Promise<LiveSpotSnapshot> {
-  const nowMs = Date.now();
-  if (!force && cachedLiveMarket && nowMs - cachedLiveMarketAtMs < 950) {
-    return cachedLiveMarket;
-  }
-  if (liveMarketFetchInFlight) {
-    return await liveMarketFetchInFlight;
-  }
+async function startServer() {
+  await chartStore.init();
 
-  liveMarketFetchInFlight = (async (): Promise<LiveSpotSnapshot> => {
+  const app = express();
+  app.use(express.json({ limit: '1mb' }));
+
+  app.get('/api/v1/health', (_req, res) => {
+    const files = collectDebFiles(DEB_ROOT, DEB_ROOT);
+    res.json({
+      status: 'nominal',
+      service: 'Payam XAUUSD Institutional Workstation & Ubuntu .deb Suite',
+      geminiConfigured: Boolean(getGeminiClient()),
+      debFilesCount: files.length,
+      storage: chartStore.getStatus(),
+      port: Number(process.env.PORT || 3000),
+      ubuntuTargetPort: 8787,
+      timestampMs: Date.now(),
+    });
+  });
+
+  // Real Multi-Source Calibrated XAU/USD Candles (Binance PAXGUSDT -> OKX XAUT -> Yahoo GC=F + Swissquote Spot Calibration + TimescaleDB)
+  app.get('/api/candles', async (req, res) => {
+    try {
+      const rawTf = String(req.query.tf || 'M15').toUpperCase();
+      const validTfs: Timeframe[] = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4'];
+      const tf: Timeframe = validTfs.includes(rawTf as Timeframe) ? (rawTf as Timeframe) : 'M15';
+      const limit = Number(req.query.limit || 240);
+      const force = String(req.query.force || '') === '1';
+      const data = await fetchCalibratedCandles(tf, Number.isFinite(limit) ? limit : 240, force);
+      res.json(data);
+    } catch (err) {
+      res.status(502).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Unable to fetch calibrated XAUUSD candles',
+      });
+    }
+  });
+
+  app.get('/api/candles/bundle', async (req, res) => {
+    try {
+      const limit = Number(req.query.limit || 240);
+      const force = String(req.query.force || '') === '1';
+      const bundle = await fetchAllTimeframesBundle(Number.isFinite(limit) ? limit : 240, force);
+      res.json(bundle);
+    } catch (err) {
+      res.status(502).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Unable to hydrate multi-timeframe XAUUSD bundle',
+      });
+    }
+  });
+
+  // Live Interbank Swissquote XAU/USD BBO + Binance PAXGUSDT basis cross-validation proxy
+  app.get('/api/market/live', async (_req, res) => {
     const [sqResult, paxgResult] = await Promise.allSettled([
-      fetchJsonWithTimeout('https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD', 2200),
-      fetchJsonWithTimeout('https://api.binance.com/api/v3/ticker/bookTicker?symbol=PAXGUSDT', 2200),
+      fetchJsonWithTimeout('https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD', 2500),
+      fetchJsonWithTimeout('https://api.binance.com/api/v3/ticker/bookTicker?symbol=PAXGUSDT', 2500),
     ]);
 
     let spot: { bid: number; ask: number; mid: number; spread: number; source: string; tier: 1 | 2 | 3 } | null = null;
@@ -456,23 +387,13 @@ async function pollLiveMarketSnapshot(force = false): Promise<LiveSpotSnapshot> 
       };
     }
 
-    const ts = Date.now();
     if (!spot) {
-      const offlineSnap: LiveSpotSnapshot = {
-        live: false,
-        spot: null,
-        paxg: null,
-        basisUsd: 0,
-        storageBackend: chartStore.getStatus().driver,
-        timestampMs: ts,
-        reason: 'Upstream interbank feeds unreachable in current network environment',
-      };
-      cachedLiveMarket = offlineSnap;
-      cachedLiveMarketAtMs = ts;
-      return offlineSnap;
+      res.json({ live: false, reason: 'Upstream interbank feeds unreachable in current network environment' });
+      return;
     }
 
     const basisUsd = paxg ? Number((spot.mid - paxg.mid).toFixed(2)) : 0;
+    const nowMs = Date.now();
     chartStore.recordTick({
       symbol: 'XAUUSD',
       bid: spot.bid,
@@ -482,477 +403,15 @@ async function pollLiveMarketSnapshot(force = false): Promise<LiveSpotSnapshot> 
       paxgMid: paxg?.mid ?? null,
       basisUsd,
       source: spot.source,
-      timestampMs: ts,
+      timestampMs: nowMs,
     });
-
-    const snap: LiveSpotSnapshot = {
+    res.json({
       live: true,
       spot,
       paxg,
       basisUsd,
       storageBackend: chartStore.getStatus().driver,
-      timestampMs: ts,
-    };
-    cachedLiveMarket = snap;
-    cachedLiveMarketAtMs = ts;
-    return snap;
-  })();
-
-  try {
-    return await liveMarketFetchInFlight;
-  } finally {
-    liveMarketFetchInFlight = null;
-  }
-}
-
-async function startServer() {
-  await chartStore.init();
-
-  // Start Sub-Agent 1 (Macro & News Sentinel) background 45s pre-warming loop
-  subAgentOrchestrator.startMacroBackgroundLoop(() => fetchCoreGoldNewsIntelligence(false));
-
-  // Shared 1000ms SSE live spot broadcaster (only polls upstream while >= 1 SSE client is connected)
-  let sseTickTimer: NodeJS.Timeout | null = null;
-  const ensureSseTickLoop = () => {
-    if (sseTickTimer) return;
-    sseTickTimer = setInterval(async () => {
-      if (sseClients.size === 0) {
-        if (sseTickTimer) {
-          clearInterval(sseTickTimer);
-          sseTickTimer = null;
-        }
-        return;
-      }
-      try {
-        const snap = await pollLiveMarketSnapshot(false);
-        broadcastSseEvent('spot_tick', snap);
-      } catch {
-        // Keep SSE stream alive even on transient upstream timeout
-      }
-    }, 1000);
-    sseTickTimer.unref?.();
-  };
-
-  const app = express();
-  app.use(express.json({ limit: '2mb' }));
-
-  app.get('/api/v1/health', (_req, res) => {
-    const files = collectDebFiles(DEB_ROOT, DEB_ROOT);
-    const aiCfg = aiProviderHub.getSanitizedConfig();
-    res.json({
-      status: 'nominal',
-      service: 'Payam XAUUSD Institutional Workstation & Ubuntu .deb Suite',
-      geminiConfigured: aiCfg.hasConfiguredGeminiKey,
-      aiProviderConfigured: aiProviderHub.hasAnyUsableAiProvider(),
-      aiProviderMode: aiCfg.providerMode,
-      macroRegime: subAgentOrchestrator.getCachedMacroBrief().regime,
-      sseClientsConnected: sseClients.size,
-      mcpPendingJobsCount: mcpPendingJobs.length,
-      debFilesCount: files.length,
-      storage: chartStore.getStatus(),
-      port: Number(process.env.PORT || 3000),
-      ubuntuTargetPort: 8787,
-      timestampMs: Date.now(),
-    });
-  });
-
-  // --- Universal AI Provider & Auth Hub Endpoints ---
-  app.get('/api/ai/config', (_req, res) => {
-    res.json({
-      ok: true,
-      config: aiProviderHub.getSanitizedConfig(),
-      subAgentStatus: subAgentOrchestrator.getSubAgentStatesSnapshot(),
-    });
-  });
-
-  app.post('/api/ai/config', (req, res) => {
-    try {
-      const patch = req.body && typeof req.body === 'object' ? req.body : {};
-      const updated = aiProviderHub.updateConfig(patch);
-      if (typeof patch.macroPollIntervalSec === 'number') {
-        subAgentOrchestrator.startMacroBackgroundLoop(
-          () => fetchCoreGoldNewsIntelligence(false),
-          updated.macroPollIntervalSec
-        );
-      }
-      recordServerAudit(
-        'AI_CONFIG',
-        'INFO',
-        `AI Hub Config Updated (${updated.providerMode})`,
-        `Saved safely to ${updated.configFilePath}`
-      );
-      broadcastSseEvent('ai_config_updated', {
-        providerMode: updated.providerMode,
-        updatedAtMs: updated.updatedAtMs,
-      });
-      res.json({
-        ok: true,
-        config: updated,
-        subAgentStatus: subAgentOrchestrator.getSubAgentStatesSnapshot(),
-      });
-    } catch (err) {
-      res.status(400).json({
-        ok: false,
-        error: err instanceof Error ? err.message : 'Invalid AI configuration payload',
-      });
-    }
-  });
-
-  app.get('/api/ai/auth-status', async (_req, res) => {
-    try {
-      const status = await aiProviderHub.detectCliAuthStatus();
-      res.json({ ok: true, ...status });
-    } catch (err) {
-      res.status(500).json({
-        ok: false,
-        error: err instanceof Error ? err.message : 'Failed to inspect CLI / OAuth auth status',
-      });
-    }
-  });
-
-  app.post('/api/ai/trigger-cli-login', async (req, res) => {
-    try {
-      const rawPreferred = String(req.body?.preferredCli ?? req.body?.cli ?? 'auto').toLowerCase();
-      const preferred =
-        rawPreferred === 'agy' || rawPreferred === 'gemini' ? rawPreferred : 'auto';
-      const result = await aiProviderHub.triggerCliLogin(preferred);
-      recordServerAudit(
-        'AI_CONFIG',
-        result.ok ? 'INFO' : 'WARN',
-        `CLI OAuth Trigger (${result.cliUsed})`,
-        result.message
-      );
-      res.status(result.ok ? 200 : 404).json(result);
-    } catch (err) {
-      res.status(500).json({
-        ok: false,
-        error: err instanceof Error ? err.message : 'Failed to trigger CLI login flow',
-      });
-    }
-  });
-
-  app.post('/api/ai/test-connection', async (req, res) => {
-    try {
-      const overridePatch =
-        req.body && typeof req.body === 'object' && Object.keys(req.body).length > 0
-          ? req.body
-          : undefined;
-      const result = await aiProviderHub.testConnection(overridePatch);
-      res.status(result.ok ? 200 : 502).json(result);
-    } catch (err) {
-      res.status(502).json({
-        ok: false,
-        latencyMs: 0,
-        modelUsed: '',
-        providerMode: aiProviderHub.getRawConfig().providerMode,
-        error: err instanceof Error ? err.message : 'Connection test error',
-      });
-    }
-  });
-
-  app.get('/api/ai/macro-brief', (_req, res) => {
-    res.json({
-      ok: true,
-      macroBrief: subAgentOrchestrator.getCachedMacroBrief(),
-      subAgentStatus: subAgentOrchestrator.getSubAgentStatesSnapshot(),
-    });
-  });
-
-  app.post('/api/ai/macro-brief/refresh', async (_req, res) => {
-    try {
-      const intel = await fetchCoreGoldNewsIntelligence(true);
-      const brief = await subAgentOrchestrator.refreshMacroRegimeBrief(intel, null);
-      res.json({ ok: true, macroBrief: brief });
-    } catch (err) {
-      res.status(502).json({
-        ok: false,
-        error: err instanceof Error ? err.message : 'Failed to refresh Macro Sentinel brief',
-      });
-    }
-  });
-
-  // --- Mode D: Native Antigravity MCP Bridge Endpoints ---
-  app.get('/api/v1/agent/poll-jobs', (_req, res) => {
-    const nowMs = Date.now();
-    // Prune expired jobs before returning
-    for (let i = mcpPendingJobs.length - 1; i >= 0; i--) {
-      if (mcpPendingJobs[i].expiresAtMs <= nowMs) {
-        mcpPendingJobs.splice(i, 1);
-      }
-    }
-    res.json({
-      ok: true,
-      jobs: mcpPendingJobs,
-      count: mcpPendingJobs.length,
       timestampMs: nowMs,
-    });
-  });
-
-  app.get('/api/v1/agent/proposals', (_req, res) => {
-    res.json({
-      ok: true,
-      proposals: mcpProposals,
-      advisories: mcpAdvisories.slice(0, 20),
-      pendingJobsCount: mcpPendingJobs.length,
-    });
-  });
-
-  app.post('/api/v1/agent/proposals', (req, res) => {
-    const body = req.body ?? {};
-    const jobId = typeof body.job_id === 'string' ? body.job_id : typeof body.jobId === 'string' ? body.jobId : undefined;
-    const direction = String(body.direction ?? 'LONG').toUpperCase() === 'SHORT' ? 'SHORT' : 'LONG';
-    const entry = Number(body.entry);
-    const stopLoss = Number(body.stopLoss ?? body.stop_loss);
-    const tp1 = Number(body.tp1);
-    const tp2 = Number(body.tp2);
-    const atr = Number(body.atr ?? 3.5);
-    const spotPrice = Number(body.spotPrice ?? body.spot_price ?? cachedLiveMarket?.spot?.mid ?? entry);
-    const minRrRatio = Number(body.minRrRatio ?? body.min_rr_ratio ?? 1.5);
-
-    const ledgerCheck = verifyProposalAgainstFactLedger(
-      { direction, entry, stopLoss, tp1, tp2, invalidationPrice: Number(body.invalidationPrice ?? body.invalidation_price ?? stopLoss) },
-      {
-        spotPrice,
-        spread: Number(cachedLiveMarket?.spot?.spread ?? 0.24),
-        atr: Number.isFinite(atr) && atr > 0 ? atr : 3.5,
-        minRrRatio,
-        fvgs: Array.isArray(body.fvgs) ? body.fvgs : [],
-        orderBlocks: Array.isArray(body.orderBlocks) ? body.orderBlocks : [],
-        dealingRange: body.dealingRange ?? null,
-      }
-    );
-
-    const guard = validateTradeGuardrails(direction, ledgerCheck.entry, stopLoss, tp1, tp2, atr);
-    if (!ledgerCheck.valid || !guard.valid) {
-      const errors = [...new Set([...ledgerCheck.errors, ...guard.errors])];
-      recordServerAudit('STAND_DOWN', 'WARN', `MCP Proposal Rejected (${direction})`, errors.join('; '));
-      res.status(422).json({
-        ok: false,
-        decision: 'STAND_DOWN',
-        errors,
-        factLedger: ledgerCheck,
-      });
-      return;
-    }
-
-    const proposal = {
-      id: `prop-mcp-${Date.now().toString(36)}`,
-      jobId: jobId ?? null,
-      direction,
-      orderType: String(body.orderType ?? body.order_type ?? 'LIMIT').toUpperCase() === 'MARKET' ? 'MARKET' : 'LIMIT',
-      setupType: String(body.setupType ?? body.setup_type ?? 'Antigravity MCP Proposal'),
-      timeframe: String(body.timeframe ?? 'M15').toUpperCase(),
-      entry: ledgerCheck.entry,
-      stopLoss: ledgerCheck.stopLoss,
-      tp1: ledgerCheck.tp1,
-      tp2: ledgerCheck.tp2,
-      invalidationPrice: ledgerCheck.invalidationPrice,
-      ttlBars: Math.max(2, Math.min(20, Math.round(Number(body.ttlBars ?? body.ttl_bars ?? 6)))),
-      rrRatio: ledgerCheck.rrRatio,
-      confidence: Math.max(0.55, Math.min(0.97, Number(body.confidence ?? 0.82))),
-      rationaleEn: String(body.rationaleEn ?? body.rationale_en ?? ''),
-      rationaleFa: String(body.rationaleFa ?? body.rationale_fa ?? ''),
-      thinkingTrace: String(body.thinkingTrace ?? body.thinking_trace ?? ''),
-      confluenceScore: Number(body.confluenceScore ?? body.confluence_score ?? 78),
-      convictionGrade: String(body.convictionGrade ?? body.conviction_grade ?? 'A'),
-      toolsUsed: Array.isArray(body.toolsUsed) ? body.toolsUsed : ['antigravity_mcp_bridge', 'fact_ledger_guard'],
-      engineSource: 'ANTIGRAVITY_MCP',
-      status: 'PROPOSED',
-      factLedgerAudit: {
-        snapped: ledgerCheck.snapped,
-        originalEntry: ledgerCheck.originalEntry,
-        matchedAnchor: ledgerCheck.matchedAnchor?.label ?? null,
-        auditSummary: ledgerCheck.auditSummary,
-      },
-      createdAtMs: Date.now(),
-    };
-
-    mcpProposals.unshift(proposal);
-    if (mcpProposals.length > 50) mcpProposals.length = 50;
-
-    // Resolve any pending Mode D job waiting on this MCP push
-    const resolvedJob = resolvePendingMcpJob(
-      jobId,
-      JSON.stringify({ decision: 'PROPOSE', ...proposal })
-    );
-
-    recordServerAudit(
-      'PROPOSAL',
-      'INFO',
-      `MCP Proposal Registered (${direction} @ $${proposal.entry.toFixed(2)})`,
-      `${proposal.setupType} · R:R 1:${proposal.rrRatio.toFixed(2)} · resolvedJob=${resolvedJob}`
-    );
-    broadcastSseEvent('mcp_proposal', proposal);
-
-    res.json({
-      ok: true,
-      resolvedJob,
-      proposal,
-      factLedger: ledgerCheck,
-    });
-  });
-
-  app.post('/api/v1/agent/submit-advisory', (req, res) => {
-    const body = req.body ?? {};
-    const jobId = String(body.job_id ?? body.jobId ?? `adv-${Date.now().toString(36)}`);
-    const advisory = {
-      id: `adv-mcp-${Date.now().toString(36)}`,
-      jobId,
-      job_id: jobId,
-      verdict: String(body.verdict ?? 'HOLD').toUpperCase(),
-      confidence: Math.max(0, Math.min(1, Number(body.confidence ?? 0.78))),
-      rationaleEn: String(body.rationaleEn ?? body.rationale_en ?? ''),
-      rationaleFa: String(body.rationaleFa ?? body.rationale_fa ?? ''),
-      thinkingTrace: String(body.thinkingTrace ?? body.thinking_trace ?? ''),
-      payload: body.payload ?? null,
-      createdAtMs: Date.now(),
-    };
-
-    mcpAdvisories.unshift(advisory);
-    if (mcpAdvisories.length > 50) mcpAdvisories.length = 50;
-
-    const resolvedJob = resolvePendingMcpJob(
-      jobId,
-      typeof body.rawJson === 'string'
-        ? body.rawJson
-        : JSON.stringify(body.payload ?? advisory)
-    );
-
-    recordServerAudit(
-      'ADVISORY',
-      'INFO',
-      `MCP Advisory Submitted (${advisory.verdict})`,
-      `jobId=${jobId} · resolvedJob=${resolvedJob}`
-    );
-    broadcastSseEvent('advisory_update', advisory);
-
-    res.json({ ok: true, resolvedJob, advisory });
-  });
-
-  app.get('/api/v1/agent/circuit-breakers', (_req, res) => {
-    const macroBrief = subAgentOrchestrator.getCachedMacroBrief();
-    const shockActive = macroBrief.regime === 'SHOCK_LOCKOUT';
-    const currentCanTrade = Boolean(latestCircuitBreakers.canOpenNewTrades) && !shockActive;
-    const activeBreakers = Array.isArray(latestCircuitBreakers.activeBreakers)
-      ? [...(latestCircuitBreakers.activeBreakers as string[])]
-      : [];
-    if (shockActive && !activeBreakers.includes('NEWS_SHOCK_GUARD')) {
-      activeBreakers.push('NEWS_SHOCK_GUARD');
-    }
-
-    res.json({
-      ok: true,
-      ...latestCircuitBreakers,
-      canOpenNewTrades: currentCanTrade,
-      activeBreakers,
-      macroRegime: macroBrief.regime,
-      liveSpread: cachedLiveMarket?.spot?.spread ?? null,
-      timestampMs: Date.now(),
-    });
-  });
-
-  app.get('/api/v1/agent/audit', (req, res) => {
-    const limit = Math.max(1, Math.min(100, Number(req.query.limit ?? 40) || 40));
-    res.json({
-      ok: true,
-      entries: serverAuditLog.slice(0, limit),
-      total: serverAuditLog.length,
-      timestampMs: Date.now(),
-    });
-  });
-
-  // Real Multi-Source Calibrated XAU/USD Candles (Binance PAXGUSDT -> OKX XAUT -> Yahoo GC=F + Swissquote Spot Calibration + TimescaleDB)
-  app.get('/api/candles', async (req, res) => {
-    try {
-      const rawTf = String(req.query.tf || 'M15').toUpperCase();
-      const validTfs: Timeframe[] = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4'];
-      const tf: Timeframe = validTfs.includes(rawTf as Timeframe) ? (rawTf as Timeframe) : 'M15';
-      const limit = Number(req.query.limit || 240);
-      const force = String(req.query.force || '') === '1';
-      const data = await fetchCalibratedCandles(tf, Number.isFinite(limit) ? limit : 240, force);
-      res.json(data);
-    } catch (err) {
-      res.status(502).json({
-        ok: false,
-        error: err instanceof Error ? err.message : 'Unable to fetch calibrated XAUUSD candles',
-      });
-    }
-  });
-
-  app.get('/api/candles/bundle', async (req, res) => {
-    try {
-      const limit = Number(req.query.limit || 240);
-      const force = String(req.query.force || '') === '1';
-      const bundle = await fetchAllTimeframesBundle(Number.isFinite(limit) ? limit : 240, force);
-      res.json(bundle);
-    } catch (err) {
-      res.status(502).json({
-        ok: false,
-        error: err instanceof Error ? err.message : 'Unable to hydrate multi-timeframe XAUUSD bundle',
-      });
-    }
-  });
-
-  // Live Interbank Swissquote XAU/USD BBO + Binance PAXGUSDT basis cross-validation proxy
-  app.get('/api/market/live', async (_req, res) => {
-    const snap = await pollLiveMarketSnapshot(false);
-    if (!snap.live) {
-      res.json({ live: false, reason: snap.reason });
-      return;
-    }
-    res.json(snap);
-  });
-
-  // Real-Time Server-Sent Events (SSE) Stream: 1000ms live spot ticks + live sub-agent telemetry
-  app.get('/api/market/stream', async (req, res) => {
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache, no-transform');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no');
-    res.flushHeaders?.();
-
-    sseClients.add(res);
-    ensureSseTickLoop();
-
-    // Send immediate handshake + current sub-agent snapshot + cached macro brief
-    res.write(
-      `event: connected\ndata: ${JSON.stringify({
-        ok: true,
-        cadenceMs: 1000,
-        providerMode: aiProviderHub.getRawConfig().providerMode,
-        subAgentSnapshot: subAgentOrchestrator.getSubAgentStatesSnapshot(),
-        timestampMs: Date.now(),
-      })}\n\n`
-    );
-
-    if (cachedLiveMarket) {
-      res.write(`event: spot_tick\ndata: ${JSON.stringify(cachedLiveMarket)}\n\n`);
-    } else {
-      pollLiveMarketSnapshot(false)
-        .then((snap) => {
-          if (sseClients.has(res)) {
-            res.write(`event: spot_tick\ndata: ${JSON.stringify(snap)}\n\n`);
-          }
-        })
-        .catch(() => {});
-    }
-
-    const heartbeat = setInterval(() => {
-      if (!sseClients.has(res)) {
-        clearInterval(heartbeat);
-        return;
-      }
-      try {
-        res.write(`: heartbeat ${Date.now()}\n\n`);
-      } catch {
-        sseClients.delete(res);
-        clearInterval(heartbeat);
-      }
-    }, 15_000);
-
-    req.on('close', () => {
-      clearInterval(heartbeat);
-      sseClients.delete(res);
     });
   });
 
@@ -961,8 +420,6 @@ async function startServer() {
     try {
       const force = String(req.query.force ?? '') === '1';
       const intel = await fetchCoreGoldNewsIntelligence(force);
-      // Asynchronously refresh Sub-Agent 1 Macro Sentinel cache whenever news updates (zero added latency to response)
-      void subAgentOrchestrator.refreshMacroRegimeBrief(intel, null);
       res.json({ ok: true, ...intel });
     } catch (err) {
       res.status(502).json({
@@ -972,280 +429,309 @@ async function startServer() {
     }
   });
 
-  // Server-Side 5-Sub-Agent Parallel Proposal Endpoint (with Gate Short-Circuit Fix + Fact Ledger)
+  // Server-Side Gemini Agentic Proposal Endpoint (gemini-4-hydrogen + Payam Institutional Brain v3 Constitution)
   app.post('/api/agent/propose', async (req, res) => {
-    const {
-      spotPrice,
-      spread,
-      timeframe,
-      quant,
-      newsGate,
-      divergence,
-      basis,
-      agentConfig,
-      circuitBreakers,
-      liveNews,
-      forceDeepAudit,
-    } = req.body ?? {};
-    const basisCtx = divergence ?? basis;
+    const ai = getGeminiClient();
+    if (!ai) {
+      res.status(503).json({
+        error: 'GEMINI_API_KEY is not configured in server Secrets.',
+        code: 'MISSING_API_KEY',
+      });
+      return;
+    }
 
+    const { spotPrice, spread, timeframe, quant, newsGate, divergence, basis, agentConfig, circuitBreakers, liveNews } =
+      req.body ?? {};
+    const basisCtx = divergence ?? basis;
     if (!Number.isFinite(spotPrice) || !quant) {
       res.status(400).json({ error: 'Missing spotPrice or quant context' });
       return;
     }
 
-    if (circuitBreakers && typeof circuitBreakers === 'object') {
-      latestCircuitBreakers = { ...circuitBreakers, updatedAtMs: Date.now() };
-    }
-
     const brain = quant.brain;
-    const minScore = Number(agentConfig?.minConfluenceScore ?? 62);
-    const bypassDeterministicGate = forceDeepAudit === true;
-
-    // 1. Absolute Non-Bypassable Risk Circuit Breaker Gate
+    // Hard server-side discipline: NEVER override deterministic Risk Circuit Breakers, Kill Switch, News LOCKOUT, or Brain hard vetoes
     if (circuitBreakers && circuitBreakers.canOpenNewTrades === false) {
-      const reasonEn =
-        circuitBreakers.summaryEn ||
-        `Risk Circuit Breaker halted new entries (${(circuitBreakers.activeBreakers ?? []).join(', ')}).`;
-      const reasonFa =
-        circuitBreakers.summaryFa ||
-        'فیوزهای مدیریت ریسک و حفاظت سرمایه فعال شده‌اند؛ صدور معامله جدید مسدود است.';
-      recordServerAudit('CIRCUIT_BREAKER', 'WARN', 'Proposal Short-Circuited by Circuit Breaker', reasonEn);
       res.json({
         ok: true,
         decision: 'STAND_DOWN',
-        shortCircuited: true,
-        standDownReasonEn: reasonEn,
-        standDownReasonFa: reasonFa,
+        standDownReasonEn:
+          circuitBreakers.summaryEn ||
+          `Risk Circuit Breaker halted new entries (${(circuitBreakers.activeBreakers ?? []).join(', ')}).`,
+        standDownReasonFa:
+          circuitBreakers.summaryFa ||
+          'فیوزهای مدیریت ریسک و حفاظت سرمایه فعال شده‌اند؛ صدور معامله جدید مسدود است.',
         watchlistZone: brain?.watchlistZone ?? null,
-        macroBrief: subAgentOrchestrator.getCachedMacroBrief(),
       });
       return;
     }
 
-    // 2. Fixed Gate Short-Circuit (Zero Wasted LLM Latency/Tokens unless forceDeepAudit === true)
-    if (!bypassDeterministicGate) {
-      const hasHardVetoes = Array.isArray(brain?.hardVetoes) && brain.hardVetoes.length > 0;
-      const isBrainStandDown = String(brain?.decision ?? '').toUpperCase() === 'STAND_DOWN';
-      const isScoreBelowMin = typeof brain?.totalScore === 'number' && brain.totalScore < minScore;
-      const isNewsBlocked = Boolean(newsGate?.vetoNewEntries) || Boolean(liveNews?.shockDetected);
-
-      if (isNewsBlocked || hasHardVetoes || isBrainStandDown || isScoreBelowMin) {
-        const reasons: string[] = [];
-        if (isNewsBlocked) reasons.push('NEWS_LOCKOUT_OR_SHOCK');
-        if (hasHardVetoes) reasons.push(`HARD_VETOES(${brain.hardVetoes.join(', ')})`);
-        if (isBrainStandDown) reasons.push('BRAIN_DECISION=STAND_DOWN');
-        if (isScoreBelowMin) reasons.push(`SCORE=${brain.totalScore}/${minScore}`);
-
-        const reasonEn =
+    if (newsGate?.vetoNewEntries || liveNews?.shockDetected || (Array.isArray(brain?.hardVetoes) && brain.hardVetoes.length > 0)) {
+      res.json({
+        ok: true,
+        decision: 'STAND_DOWN',
+        standDownReasonEn:
           brain?.summaryEn ||
-          `Deterministic gate short-circuited scan (${reasons.join(' · ')}). Zero LLM latency incurred.`;
-        const reasonFa =
+          `Hard Veto active (${(brain?.hardVetoes ?? ['NEWS_SHIELD']).join(', ')}). Payam Brain refused to chase or force a low-edge entry.`,
+        standDownReasonFa:
           brain?.summaryFa ||
-          `فیلتر قطعی سیستم ۱ پیش از فراخوانی هوش مصنوعی دستور ایست صادر کرد (${reasons.join(' · ')}).`;
-
-        recordServerAudit('STAND_DOWN', 'INFO', 'Gate Short-Circuit STAND_DOWN', reasons.join(' · '));
-        res.json({
-          ok: true,
-          decision: 'STAND_DOWN',
-          shortCircuited: true,
-          shortCircuitReasons: reasons,
-          standDownReasonEn: reasonEn,
-          standDownReasonFa: reasonFa,
-          watchlistZone: brain?.watchlistZone ?? null,
-          macroBrief: subAgentOrchestrator.getCachedMacroBrief(),
-        });
-        return;
-      }
-    }
-
-    if (!aiProviderHub.hasAnyUsableAiProvider()) {
-      res.status(503).json({
-        error:
-          'No AI provider is configured. Configure Gemini API Key, Local Subscription CLIProxyAPI, Custom OpenAI-Compatible URL, or MCP Bridge in AI Provider Hub.',
-        code: 'MISSING_API_KEY',
+          'فیلتر ضد هیجان و مدیریت ریسک فعال است؛ مغز تحلیلی پیام از صدور پوزیشن پرریسک خودداری کرد.',
+        watchlistZone: brain?.watchlistZone ?? null,
       });
       return;
     }
 
     try {
-      // Pass COMPLETE 5-Stage ICT payload into Zero-Latency 5-Sub-Agent Parallel Orchestrator
-      const pipelineResult = await subAgentOrchestrator.runProposalPipeline({
-        spotPrice: Number(spotPrice),
-        spread: Number(spread ?? 0.24),
-        timeframe: String(timeframe || quant.timeframe || 'M15'),
-        quant: {
-          ...quant,
-          structures: quant.structures ?? [],
-          liquidity: quant.liquidity ?? [],
-          tfs: quant.tfs ?? null,
-          tpi: quant.tpi ?? null,
-          dealingRange: quant.dealingRange ?? null,
-          fvgs: quant.fvgs ?? [],
-          orderBlocks: quant.orderBlocks ?? [],
-          rsi: quant.rsi ?? null,
-          regime: quant.regime ?? null,
-          brain: {
-            ...(brain ?? {}),
-            mtfMatrix: brain?.mtfMatrix ?? quant.mtfMatrix ?? [],
+      const atr = Number(quant.regime?.atr ?? 3.5);
+      const minRr = Number(agentConfig?.minRrRatio ?? 1.75);
+      const minScore = Number(agentConfig?.minConfluenceScore ?? 62);
+      const minStop = Math.max(2.0, atr * 0.85, Number(spread ?? 0.24) * 3.5);
+      const topHeadlines = Array.isArray(liveNews?.headlines)
+        ? liveNews.headlines.slice(0, 6).map((h: ScoredNewsHeadline) => ({
+            source: h.sourceName,
+            title: h.title,
+            bias: h.goldBias,
+            impact: h.impactScore,
+          }))
+        : [];
+      const prompt = [
+        `You are Payam, a ruthless, zero-emotion institutional XAU/USD (Gold) quantitative trader.`,
+        `YOUR TRADING CONSTITUTION (STRICTLY ENFORCED):`,
+        `1. TOP-DOWN HIERARCHY: 4H (H4) is the Macro Directional Compass (20 pts). Never trade blindly against a strong H4 trend unless Counter-H4 is enabled AND an H1/M15 liquidity sweep + Regular RSI(14) divergence confirm a temporary scalp.`,
+        `2. EXECUTION CORE (1H & LOWER): Require 1H/M15/M5 structural confirmation (BOS/CHoCH or stop-hunt wick sweep of BSL/SSL, 20 pts), institutional Order Block quality (body >= 55%, displacement >= 1.1x ATR, 18 pts), and Fair Value Gap CE 50% / Golden OB+FVG overlap (15 pts).`,
+        `3. WILDER RSI(14) REGIME & DIVERGENCE (15 pts): Respect Cardwell/Hayden regimes (Bullish 40-80, Bearish 20-60). Prioritize Hidden Divergence for trend pullbacks and Regular Divergence for reversal confirmation. NEVER chase RSI > 72 on longs or RSI < 28 on shorts.`,
+        `4. OTE, CENTRAL BANK & MACRO HYGIENE (12 pts): Prefer Discount (<50%, OTE 61.8%-78.6%) for LONG and Premium (>50%, OTE 61.8%-78.6%) for SHORT. Weigh live Federal Reserve / BLS / BEA / ECB / Kitco / FXStreet Gold Macro Sentiment & USD News Gate.`,
+        `5. ZERO-EMOTION STAND_DOWN RULE: If weighted confluence < ${minScore}/100, price is overextended (>1.85x ATR), chop efficiency is low, or macro wire conflicts sharply, you MUST return decision="STAND_DOWN" instead of forcing a trade.`,
+        `6. HARD MATHEMATICAL INVARIANTS (if decision="PROPOSE"):`,
+        `   - LONG: stopLoss < entry < tp1 < tp2 | SHORT: stopLoss > entry > tp1 > tp2`,
+        `   - R:R |tp1 - entry| / |entry - stopLoss| MUST be >= ${minRr.toFixed(2)}`,
+        `   - Stop distance |entry - stopLoss| MUST be >= ${minStop.toFixed(2)} USD and structurally beyond the OB extreme wick.`,
+        `   - Anchor Entry strictly to provided OB MT50, FVG CE50, OTE level, or spot ${Number(spotPrice).toFixed(2)}. Never hallucinate numbers.`,
+        `Deterministic Payam Brain Snapshot JSON: ${JSON.stringify({
+          spotPrice,
+          spread,
+          timeframe,
+          agentConfig: agentConfig
+            ? {
+                minConfluenceScore: minScore,
+                minRrRatio: minRr,
+                allowCounterH4Scalps: Boolean(agentConfig.allowCounterH4Scalps),
+                maxPortfolioHeatPct: agentConfig.maxPortfolioHeatPct,
+              }
+            : null,
+          circuitBreakers: circuitBreakers
+            ? {
+                effectiveRiskMultiplier: circuitBreakers.effectiveRiskMultiplier,
+                dailyDrawdownPct: circuitBreakers.dailyDrawdownPct,
+                openPortfolioHeatPct: circuitBreakers.openPortfolioHeatPct,
+                consecutiveLosses: circuitBreakers.consecutiveLosses,
+              }
+            : null,
+          liveMacroNews: {
+            macroSentiment: liveNews?.macroSentiment ?? 'NEUTRAL',
+            sentimentScore: liveNews?.sentimentScore ?? 0,
+            topHeadlines,
           },
+          brain: brain
+            ? {
+                decision: brain.decision,
+                convictionGrade: brain.convictionGrade,
+                totalScore: brain.totalScore,
+                longScore: brain.longScore,
+                shortScore: brain.shortScore,
+                h4Bias: brain.h4Bias,
+                h1Bias: brain.h1Bias,
+                killzone: brain.killzone,
+                atrExtension: brain.atrExtension,
+                kaufmanEfficiency: brain.kaufmanEfficiency,
+                goldenConfluence: brain.goldenConfluence,
+                sweepDetected: brain.sweepDetected,
+                pillars: brain.pillars,
+                defenseGates: brain.defenseGates,
+                watchlistZone: brain.watchlistZone,
+              }
+            : null,
+          rsi: quant.rsi ? { active: quant.rsi.active, h4: quant.rsi.byTimeframe?.H4, h1: quant.rsi.byTimeframe?.H1, m15: quant.rsi.byTimeframe?.M15, m5: quant.rsi.byTimeframe?.M5 } : null,
+          dealingRange: quant.dealingRange,
+          regime: quant.regime,
+          fvgs: quant.fvgs?.slice(-3),
+          orderBlocks: quant.orderBlocks?.slice(-3),
+          newsGate: newsGate?.state,
+          basis: basisCtx,
+        })}`,
+      ].join('\n');
+
+      const rawJson = await generateStructuredJson(ai, prompt, {
+        type: Type.OBJECT,
+        properties: {
+          decision: { type: Type.STRING, description: 'PROPOSE or STAND_DOWN' },
+          direction: { type: Type.STRING, description: 'LONG or SHORT' },
+          setupType: { type: Type.STRING, description: 'Concise institutional setup name (e.g., Golden OB+FVG OTE Retest + H4 Bullish)' },
+          entry: { type: Type.NUMBER },
+          stopLoss: { type: Type.NUMBER },
+          tp1: { type: Type.NUMBER },
+          tp2: { type: Type.NUMBER },
+          confidence: { type: Type.NUMBER, description: '0.62 to 0.96' },
+          rationaleEn: { type: Type.STRING, description: '2 concise sentences explaining H4 bias, OB/FVG/Sweep trigger, RSI regime, and invalidation in English' },
+          rationaleFa: { type: Type.STRING, description: '2 concise sentences explaining H4 bias, OB/FVG/Sweep trigger, RSI regime, and invalidation in Persian (Farsi)' },
+          standDownReasonEn: { type: Type.STRING, description: 'If STAND_DOWN, why Payam refused to trade' },
+          standDownReasonFa: { type: Type.STRING, description: 'If STAND_DOWN, Persian explanation of why Payam stood down' },
+          toolsUsed: { type: Type.ARRAY, items: { type: Type.STRING } },
         },
-        newsGate,
-        basis: basisCtx,
-        agentConfig,
-        circuitBreakers,
-        liveNews,
-        forceDeepAudit: bypassDeterministicGate,
+        required: ['decision', 'direction', 'setupType', 'entry', 'stopLoss', 'tp1', 'tp2', 'confidence', 'rationaleEn', 'rationaleFa', 'toolsUsed'],
       });
 
-      if (pipelineResult.decision === 'STAND_DOWN' || !pipelineResult.proposal) {
-        recordServerAudit(
-          'STAND_DOWN',
-          'INFO',
-          `5-Sub-Agent STAND_DOWN (${pipelineResult.totalLatencyMs}ms)`,
-          pipelineResult.standDownReasonEn || 'Chief Execution Judge or Fact Ledger enforced STAND_DOWN.'
-        );
+      const parsed = JSON.parse(rawJson);
+      if (String(parsed.decision).toUpperCase() === 'STAND_DOWN') {
         res.json({
           ok: true,
           decision: 'STAND_DOWN',
-          pipelineId: pipelineResult.pipelineId,
-          totalLatencyMs: pipelineResult.totalLatencyMs,
-          standDownReasonEn:
-            pipelineResult.standDownReasonEn ||
-            brain?.summaryEn ||
-            'Setup did not pass Payam 5-Sub-Agent & Fact Ledger institutional verification.',
-          standDownReasonFa:
-            pipelineResult.standDownReasonFa ||
-            brain?.summaryFa ||
-            'ستاپ معاملاتی نتوانست تایید ۵ زیرعامل و دفتر کل ضد توهم پیام را کسب کند.',
+          standDownReasonEn: String(parsed.standDownReasonEn || parsed.rationaleEn || brain?.summaryEn || 'Setup did not meet Payam institutional threshold.'),
+          standDownReasonFa: String(parsed.standDownReasonFa || parsed.rationaleFa || brain?.summaryFa || 'ستاپ معاملاتی به حد نصاب امتیاز نهادی پیام نرسید.'),
           watchlistZone: brain?.watchlistZone ?? null,
-          macroBrief: pipelineResult.macroBrief,
-          subAgents: {
-            sniper: pipelineResult.sniper,
-            redTeam: pipelineResult.redTeam,
-            judge: pipelineResult.judge,
-          },
-          factLedger: pipelineResult.factLedger,
         });
         return;
       }
 
-      // Secondary System-1 deterministic guardrail sanity check
-      const atr = Number(quant.regime?.atr ?? 3.5);
-      const guard = validateTradeGuardrails(
-        pipelineResult.proposal.direction,
-        pipelineResult.proposal.entry,
-        pipelineResult.proposal.stopLoss,
-        pipelineResult.proposal.tp1,
-        pipelineResult.proposal.tp2,
-        atr
-      );
+      const dir = String(parsed.direction).toUpperCase() === 'SHORT' ? 'SHORT' : 'LONG';
+      const guard = validateTradeGuardrails(dir, Number(parsed.entry), Number(parsed.stopLoss), Number(parsed.tp1), Number(parsed.tp2), atr);
 
       if (!guard.valid) {
         res.status(422).json({
           error: `Agent proposal rejected by System 1 mathematical guardrails: ${guard.errors.join('; ')}`,
           guard,
-          factLedger: pipelineResult.factLedger,
         });
         return;
       }
 
-      recordServerAudit(
-        'PROPOSAL',
-        'INFO',
-        `5-Sub-Agent Proposal ${pipelineResult.proposal.direction} ${pipelineResult.proposal.orderType} (${pipelineResult.totalLatencyMs}ms)`,
-        `${pipelineResult.proposal.setupType} @ $${pipelineResult.proposal.entry.toFixed(2)} · R:R 1:${pipelineResult.proposal.rrRatio.toFixed(2)}`
-      );
+      const activeRsi = quant.rsi?.active;
+      const rsiSummary = activeRsi
+        ? `RSI(14) ${Number(activeRsi.value).toFixed(1)} · ${String(activeRsi.regime).replace('_', ' ')}${activeRsi.divergence !== 'NONE' ? ` · ${String(activeRsi.divergence).replace('_', ' ')}` : ''}`
+        : undefined;
 
       res.json({
         ok: true,
         decision: 'PROPOSE',
-        pipelineId: pipelineResult.pipelineId,
-        totalLatencyMs: pipelineResult.totalLatencyMs,
-        proposal: pipelineResult.proposal,
-        macroBrief: pipelineResult.macroBrief,
-        subAgents: {
-          sniper: pipelineResult.sniper,
-          redTeam: pipelineResult.redTeam,
-          judge: pipelineResult.judge,
+        proposal: {
+          id: `prop-ai-${Date.now().toString(36)}`,
+          direction: dir,
+          setupType: String(parsed.setupType || 'Institutional SMC+RSI Confluence'),
+          timeframe: timeframe || 'M15',
+          entry: Number(Number(parsed.entry).toFixed(2)),
+          stopLoss: Number(Number(parsed.stopLoss).toFixed(2)),
+          tp1: Number(Number(parsed.tp1).toFixed(2)),
+          tp2: Number(Number(parsed.tp2).toFixed(2)),
+          rrRatio: guard.rrRatio,
+          confidence: Math.max(0.60, Math.min(0.96, Number(parsed.confidence || (brain?.totalScore ? brain.totalScore / 100 : 0.8)))),
+          rationaleEn: String(parsed.rationaleEn || ''),
+          rationaleFa: String(parsed.rationaleFa || ''),
+          toolsUsed: Array.isArray(parsed.toolsUsed) && parsed.toolsUsed.length > 0
+            ? parsed.toolsUsed
+            : ['h4_macro_compass', 'h1_liquidity_sweep', 'ob_quality_displacement', 'fvg_golden_overlap', 'wilder_rsi14_divergence', 'anti_chase_7gate_shield', 'validate_rr_guardrails'],
+          engineSource: 'GEMINI_AGENT',
+          status: 'PROPOSED',
+          createdAtMs: Date.now(),
+          confluenceScore: brain?.totalScore,
+          convictionGrade: brain?.convictionGrade,
+          h4Bias: brain?.h4Bias,
+          rsiSummary,
+          recommendedRiskMultiplier: brain?.recommendedRiskMultiplier,
+          pillarBreakdown: Array.isArray(brain?.pillars)
+            ? brain.pillars.map((p: { label: string; score: number; maxScore: number }) => ({
+                label: p.label,
+                score: p.score,
+                maxScore: p.maxScore,
+              }))
+            : undefined,
+          goldenConfluence: Boolean(brain?.goldenConfluence),
+          counterTrendFlag:
+            (brain?.h4Bias === 'BULLISH' && dir === 'SHORT') ||
+            (brain?.h4Bias === 'BEARISH' && dir === 'LONG'),
         },
-        factLedger: pipelineResult.factLedger,
       });
     } catch (err) {
-      if (isMissingKeyError(err)) {
-        res.status(503).json({
-          error: err instanceof Error ? err.message : 'AI provider credentials not configured.',
-          code: 'MISSING_API_KEY',
-        });
-        return;
-      }
       if (isQuotaError(err)) {
         res.status(429).json({
-          error: 'AI provider quota temporarily exhausted. Payam Institutional Brain v3 deterministic engine remains active.',
+          error: 'Gemini API quota temporarily exhausted. Payam Institutional Brain v3 deterministic engine remains active.',
           code: 'GEMINI_QUOTA_EXHAUSTED',
         });
         return;
       }
-      const msg = err instanceof Error ? err.message : 'Multi-sub-agent scan failed';
-      res.status(502).json({ error: msg, code: 'UPSTREAM_AI_ERROR' });
+      const msg = err instanceof Error ? err.message : 'Gemini agent scan failed';
+      res.status(502).json({ error: msg, code: 'UPSTREAM_GEMINI_ERROR' });
     }
   });
 
-  // Server-Side Sub-Agent 5 (Live Position Guardian) Multi-Position Broker Monitor Endpoint
+  // Server-Side Gemini Multi-Position Broker Monitor Endpoint
   app.post('/api/agent/monitor', async (req, res) => {
-    const { spotPrice, positions, quant, newsGate, divergence, basis, liveNews } = req.body ?? {};
-    const basisCtx = divergence ?? basis;
-    if (!Array.isArray(positions) || positions.length === 0) {
-      res.json({ ok: true, directives: [], reviews: [], updates: [] });
-      return;
-    }
-
-    if (!aiProviderHub.hasAnyUsableAiProvider() && aiProviderHub.isSubAgentEnabled('livePositionGuardian')) {
+    const ai = getGeminiClient();
+    if (!ai) {
       res.status(503).json({
-        error: 'No AI provider is configured for Live Position Guardian.',
+        error: 'GEMINI_API_KEY is not configured in server Secrets.',
         code: 'MISSING_API_KEY',
       });
       return;
     }
 
+    const { spotPrice, positions, quant, newsGate, divergence, basis, liveNews } = req.body ?? {};
+    const basisCtx = divergence ?? basis;
+    if (!Array.isArray(positions) || positions.length === 0) {
+      res.json({ ok: true, reviews: [], updates: [] });
+      return;
+    }
+
     try {
-      const result = await subAgentOrchestrator.runPositionGuardian({
-        spotPrice: Number(spotPrice),
-        positions,
-        quant,
-        newsGate,
-        basis: basisCtx,
-        liveNews,
+      const prompt = [
+        `You are Payam, a disciplined institutional XAU/USD position management copilot.`,
+        `Review each user-confirmed broker position below against live spot ${Number(spotPrice).toFixed(2)}, 4H Macro Compass, 1H/15M/5M SMC structure, Wilder RSI(14) regime & divergences, Basis Divergence, Live Core Gold News Wire, and USD News Gate.`,
+        `Prioritize capital preservation: flag opposing Regular RSI divergence, H4 trend flips, emergency breaking headlines, or impending USD News LOCKOUT immediately.`,
+        `Provide specific, professional, actionable trade management advice in both English and concise Persian (Farsi) for each positionId.`,
+        `Context: ${JSON.stringify({
+          spotPrice,
+          positions,
+          h4Bias: quant?.brain?.h4Bias,
+          brainScore: quant?.brain?.totalScore,
+          hardVetoes: quant?.brain?.hardVetoes,
+          rsiActive: quant?.rsi?.active,
+          rsiH1: quant?.rsi?.byTimeframe?.H1,
+          regime: quant?.regime,
+          tpi: quant?.tpi,
+          newsGate: newsGate?.state,
+          macroSentiment: liveNews?.macroSentiment,
+          shockHeadline: liveNews?.shockHeadline,
+          divergence: basisCtx,
+        })}`,
+      ].join('\n');
+
+      const rawReviews = await generateStructuredJson(ai, prompt, {
+        type: Type.ARRAY,
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            positionId: { type: Type.STRING },
+            urgency: { type: Type.STRING, description: 'NORMAL, ATTENTION, or CRITICAL' },
+            actionTag: {
+              type: Type.STRING,
+              description: 'HOLD_RUNNER, ARM_BE, MOVE_SL_RF, SCALE_PARTIAL, PROTECT_NEWS, or EXIT_WARNING',
+            },
+            adviceEn: { type: Type.STRING },
+            adviceFa: { type: Type.STRING },
+          },
+          required: ['positionId', 'urgency', 'actionTag', 'adviceEn', 'adviceFa'],
+        },
       });
 
-      res.json({
-        ok: true,
-        pipelineId: result.pipelineId,
-        latencyMs: result.latencyMs,
-        modelUsed: result.modelUsed,
-        providerMode: result.providerMode,
-        macroBrief: result.macroBrief,
-        directives: result.directives,
-        reviews: result.directives,
-        updates: result.directives,
-      });
+      const reviews = JSON.parse(rawReviews || '[]');
+      res.json({ ok: true, reviews, updates: reviews });
     } catch (err) {
-      if (isMissingKeyError(err)) {
-        res.status(503).json({
-          error: err instanceof Error ? err.message : 'AI provider credentials not configured.',
-          code: 'MISSING_API_KEY',
-        });
-        return;
-      }
       if (isQuotaError(err)) {
         res.status(429).json({
-          error: 'AI provider quota temporarily exhausted; deterministic HSM position monitor active.',
+          error: 'Gemini API quota temporarily exhausted; deterministic HSM position monitor active.',
           code: 'GEMINI_QUOTA_EXHAUSTED',
         });
         return;
       }
-      const msg = err instanceof Error ? err.message : 'Live Position Guardian monitor failed';
-      res.status(502).json({ error: msg, code: 'UPSTREAM_AI_ERROR' });
+      const msg = err instanceof Error ? err.message : 'Gemini position monitor failed';
+      res.status(502).json({ error: msg, code: 'UPSTREAM_GEMINI_ERROR' });
     }
   });
 

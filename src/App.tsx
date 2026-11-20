@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { Download, X } from 'lucide-react';
+import { Download, WifiOff, Loader2, X } from 'lucide-react';
 import { useAurumStore } from './store/useStore';
 import { PayamLogo } from './components/PayamLogo';
 import { HealthBar } from './components/HealthBar';
@@ -22,11 +22,13 @@ export default function App() {
   const streaming = useAurumStore((s) => s.streaming);
   const feedMode = useAurumStore((s) => s.feedMode);
   const agentEnabled = useAurumStore((s) => s.agentEnabled);
-  const applyTickUpdate = useAurumStore((s) => s.applyTickUpdate);
+  const confirmedPositionsCount = useAurumStore((s) => s.confirmedPositions.length);
   const hydrateRealCandles = useAurumStore((s) => s.hydrateRealCandles);
   const pollLiveMarket = useAurumStore((s) => s.pollLiveMarket);
+  const ingestSsePayload = useAurumStore((s) => s.ingestSsePayload);
   const pollLiveNews = useAurumStore((s) => s.pollLiveNews);
   const runAgentScanCycle = useAurumStore((s) => s.runAgentScanCycle);
+  const monitorOpenPositions = useAurumStore((s) => s.monitorOpenPositions);
   const statusBanner = useAurumStore((s) => s.statusBanner);
   const clearBanner = useAurumStore((s) => s.clearBanner);
 
@@ -40,15 +42,88 @@ export default function App() {
     return () => window.clearInterval(candleSyncId);
   }, [streaming, hydrateRealCandles]);
 
-  // Initial + periodic real Interbank Spot + PAXGUSDT live market polling
+  // Live SSE Stream (/api/market/stream) with automatic 1500ms /api/market/live polling fallback
   useEffect(() => {
+    // Immediate bootstrap poll for sub-second initial spot quote
     void pollLiveMarket();
     if (!streaming) return;
-    const livePollId = window.setInterval(() => {
-      void pollLiveMarket();
-    }, 3800);
-    return () => window.clearInterval(livePollId);
-  }, [streaming, pollLiveMarket]);
+
+    let es: EventSource | null = null;
+    let fallbackPollId: number | null = null;
+    let sseReconnectId: number | null = null;
+    let disposed = false;
+
+    const startFallbackPolling = () => {
+      if (disposed || fallbackPollId !== null) return;
+      fallbackPollId = window.setInterval(() => {
+        void pollLiveMarket();
+      }, 1500);
+    };
+
+    const stopFallbackPolling = () => {
+      if (fallbackPollId !== null) {
+        window.clearInterval(fallbackPollId);
+        fallbackPollId = null;
+      }
+    };
+
+    const handleSseMessage = (ev: MessageEvent) => {
+      if (disposed || !ev.data) return;
+      try {
+        const parsed = JSON.parse(ev.data);
+        if (parsed && typeof parsed === 'object') {
+          stopFallbackPolling();
+          ingestSsePayload(parsed as Record<string, unknown>);
+        }
+      } catch {
+        // Ignore keepalive / non-JSON comment frames
+      }
+    };
+
+    const connectSse = () => {
+      if (disposed || typeof EventSource === 'undefined') {
+        startFallbackPolling();
+        return;
+      }
+      try {
+        es = new EventSource('/api/market/stream');
+        es.onmessage = handleSseMessage;
+        es.addEventListener('tick', handleSseMessage as EventListener);
+        es.addEventListener('market', handleSseMessage as EventListener);
+        es.addEventListener('telemetry', handleSseMessage as EventListener);
+        es.onerror = () => {
+          if (es) {
+            es.close();
+            es = null;
+          }
+          startFallbackPolling();
+          if (!disposed && sseReconnectId === null) {
+            sseReconnectId = window.setTimeout(() => {
+              sseReconnectId = null;
+              connectSse();
+            }, 30_000);
+          }
+        };
+      } catch {
+        startFallbackPolling();
+      }
+    };
+
+    connectSse();
+
+    return () => {
+      disposed = true;
+      if (es) {
+        es.close();
+        es = null;
+      }
+      stopFallbackPolling();
+      if (sseReconnectId !== null) {
+        window.clearTimeout(sseReconnectId);
+        sseReconnectId = null;
+      }
+    };
+  }, [streaming, pollLiveMarket, ingestSsePayload]);
 
   // Initial + periodic 14-source Core Gold News & Macro Calendar polling
   useEffect(() => {
@@ -60,23 +135,24 @@ export default function App() {
     return () => window.clearInterval(newsPollId);
   }, [streaming, pollLiveNews]);
 
-  // Smooth local micro-tick heartbeat when in replay simulation mode
+  // Autonomous Payam Agentic Engine periodic scanner while Master Switch is ON AND live feed is connected
   useEffect(() => {
-    if (!streaming || feedMode === 'LIVE_INTERBANK') return;
-    const id = window.setInterval(() => {
-      applyTickUpdate();
-    }, 1800);
-    return () => window.clearInterval(id);
-  }, [streaming, feedMode, applyTickUpdate]);
-
-  // Autonomous Payam Agentic Engine periodic scanner while Master Switch is ON
-  useEffect(() => {
-    if (!agentEnabled) return;
+    if (!agentEnabled || feedMode !== 'LIVE_INTERBANK') return;
     const scanId = window.setInterval(() => {
       void runAgentScanCycle();
     }, 18_000);
     return () => window.clearInterval(scanId);
-  }, [agentEnabled, runAgentScanCycle]);
+  }, [agentEnabled, feedMode, runAgentScanCycle]);
+
+  // Relentless Co-Pilot: monitor all confirmed open broker positions every 12,000ms
+  useEffect(() => {
+    if (confirmedPositionsCount === 0) return;
+    void monitorOpenPositions();
+    const monitorId = window.setInterval(() => {
+      void monitorOpenPositions();
+    }, 12_000);
+    return () => window.clearInterval(monitorId);
+  }, [confirmedPositionsCount, monitorOpenPositions]);
 
   return (
     <div className="min-h-screen bg-[#0B0F17] text-slate-100 flex flex-col">
@@ -138,6 +214,45 @@ export default function App() {
 
       {/* Payam Autonomous Agentic Control Bar (Master Switch + Basis Divergence) */}
       <AgentCommandBar />
+
+      {/* Zero-Mock Feed Connection Guard Banner */}
+      {feedMode !== 'LIVE_INTERBANK' && (
+        <div
+          role="alert"
+          data-testid="feed-connection-banner"
+          className={`border-b px-4 lg:px-6 py-2 text-xs ${
+            feedMode === 'FEED_DISCONNECTED'
+              ? 'border-red-500/35 bg-red-950/35 text-red-200'
+              : 'border-amber-400/25 bg-amber-950/25 text-amber-100'
+          }`}
+        >
+          <div className="max-w-[1600px] mx-auto flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2 font-mono">
+              {feedMode === 'FEED_DISCONNECTED' ? (
+                <WifiOff className="w-3.5 h-3.5 text-red-400 shrink-0" />
+              ) : (
+                <Loader2 className="w-3.5 h-3.5 text-amber-300 animate-spin shrink-0" />
+              )}
+              <span className="font-semibold">{feedMode}</span>
+              <span className="text-slate-300">
+                {feedMode === 'FEED_DISCONNECTED'
+                  ? '— Live interbank XAU/USD feed disconnected. Signal scanning halted (zero synthetic prices).'
+                  : '— Connecting to live Swissquote Interbank BBO / SSE stream & calibrating 240 bars/TF...'}
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                void pollLiveMarket();
+                void hydrateRealCandles(true);
+              }}
+              className="px-2.5 py-1 rounded border border-white/15 bg-white/5 hover:bg-white/10 font-mono text-[11px] text-slate-100 transition-colors"
+            >
+              Reconnect Now
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Dismissible Action Feedback Banner */}
       {statusBanner && (
