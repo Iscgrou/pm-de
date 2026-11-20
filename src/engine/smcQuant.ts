@@ -28,7 +28,16 @@ import {
   detectLiquiditySweepFootprint,
   enrichFairValueGaps,
   enrichOrderBlocks,
+  evaluateLiquidityPoolSweep,
   evaluatePayamBrain,
+  type InstitutionalDealingRangeSnapshot,
+  type InstitutionalFairValueGap,
+  type InstitutionalLiquidityPool,
+  type InstitutionalOrderBlock,
+  type InstitutionalStructureEvent,
+  type LiquidityPoolKind,
+  type SniperAgentProposal,
+  type SniperPayamBrainReport,
 } from './payamBrain';
 
 export const TIMEFRAME_SECONDS: Record<Timeframe, number> = {
@@ -167,18 +176,54 @@ export function computeAtr(candles: Candle[], period = 14): number {
   return round3(slice.reduce((acc, v) => acc + v, 0) / Math.max(1, slice.length));
 }
 
-export function detectLuxAlgoFvgs(candles: Candle[], minGapUsd = 0.45): FairValueGap[] {
-  const fvgs: FairValueGap[] = [];
+/**
+ * Module 3 — Displacement Fair Value Gaps (FVG / CE50) with ATR-scaled minimum gap
+ * `Math.max(0.30, ATR_14 * 0.15)` and exact mitigation state tracking.
+ */
+export function detectLuxAlgoFvgs(candles: Candle[], minGapUsd?: number): InstitutionalFairValueGap[] {
+  const fvgs: InstitutionalFairValueGap[] = [];
+  if (candles.length < 3) return fvgs;
+
+  const atr = computeAtr(candles, 14);
+  const gapFloor =
+    typeof minGapUsd === 'number' && Number.isFinite(minGapUsd)
+      ? Math.max(0.3, minGapUsd)
+      : Math.max(0.3, round2(atr * 0.15));
+
   for (let i = 2; i < candles.length; i++) {
     const c1 = candles[i - 2];
     const c2 = candles[i - 1];
     const c3 = candles[i];
 
-    if (c3.low - c1.high >= minGapUsd && c2.close > c2.open) {
+    if (c3.low - c1.high >= gapFloor && c2.close > c2.open) {
       const top = round2(c3.low);
       const bottom = round2(c1.high);
       const ce50 = round2((top + bottom) / 2);
-      const mitBar = candles.slice(i + 1).find((f) => f.low <= ce50);
+      let invBar: Candle | undefined;
+      let deepMitBar: Candle | undefined;
+      let ce50WickBar: Candle | undefined;
+      let nearTouchBar: Candle | undefined;
+
+      for (let k = i + 1; k < candles.length; k++) {
+        const f = candles[k];
+        if (!nearTouchBar && f.low <= top) nearTouchBar = f;
+        if (!ce50WickBar && f.low <= ce50 && f.close >= ce50) ce50WickBar = f;
+        if (!deepMitBar && f.close < ce50) deepMitBar = f;
+        if (!invBar && f.close < bottom) {
+          invBar = f;
+          break;
+        }
+      }
+      const mitBar = invBar ?? deepMitBar;
+
+      const mitigationState: InstitutionalFairValueGap['mitigationState'] = invBar
+        ? 'INVALIDATED_INVERSION'
+        : ce50WickBar && !deepMitBar
+          ? 'CE50_TESTED'
+          : nearTouchBar
+            ? 'TOUCHED_NEAR_EDGE'
+            : 'UNMITIGATED';
+
       fvgs.push({
         id: `fvg-bull-${c2.time}`,
         direction: 'BULLISH',
@@ -188,12 +233,39 @@ export function detectLuxAlgoFvgs(candles: Candle[], minGapUsd = 0.45): FairValu
         startTime: c2.time,
         mitigated: Boolean(mitBar),
         ...(mitBar ? { mitigatedTime: mitBar.time } : {}),
+        isInversion: Boolean(invBar),
+        mitigationState,
+        createdByBosOrMss: false,
       });
-    } else if (c1.low - c3.high >= minGapUsd && c2.close < c2.open) {
+    } else if (c1.low - c3.high >= gapFloor && c2.close < c2.open) {
       const top = round2(c1.low);
       const bottom = round2(c3.high);
       const ce50 = round2((top + bottom) / 2);
-      const mitBar = candles.slice(i + 1).find((f) => f.high >= ce50);
+      let invBar: Candle | undefined;
+      let deepMitBar: Candle | undefined;
+      let ce50WickBar: Candle | undefined;
+      let nearTouchBar: Candle | undefined;
+
+      for (let k = i + 1; k < candles.length; k++) {
+        const f = candles[k];
+        if (!nearTouchBar && f.high >= bottom) nearTouchBar = f;
+        if (!ce50WickBar && f.high >= ce50 && f.close <= ce50) ce50WickBar = f;
+        if (!deepMitBar && f.close > ce50) deepMitBar = f;
+        if (!invBar && f.close > top) {
+          invBar = f;
+          break;
+        }
+      }
+      const mitBar = invBar ?? deepMitBar;
+
+      const mitigationState: InstitutionalFairValueGap['mitigationState'] = invBar
+        ? 'INVALIDATED_INVERSION'
+        : ce50WickBar && !deepMitBar
+          ? 'CE50_TESTED'
+          : nearTouchBar
+            ? 'TOUCHED_NEAR_EDGE'
+            : 'UNMITIGATED';
+
       fvgs.push({
         id: `fvg-bear-${c2.time}`,
         direction: 'BEARISH',
@@ -203,145 +275,645 @@ export function detectLuxAlgoFvgs(candles: Candle[], minGapUsd = 0.45): FairValu
         startTime: c2.time,
         mitigated: Boolean(mitBar),
         ...(mitBar ? { mitigatedTime: mitBar.time } : {}),
+        isInversion: Boolean(invBar),
+        mitigationState,
+        createdByBosOrMss: false,
       });
     }
   }
   return fvgs;
 }
 
-export function detectVolumeOrderBlocks(candles: Candle[], lookback = 4): OrderBlock[] {
-  const obs: OrderBlock[] = [];
-  if (candles.length < lookback + 3) return obs;
-  const avgVol = candles.reduce((s, c) => s + c.volume, 0) / candles.length;
+/**
+ * Module 3 — Institutional Origin Candle / Rejection Block (`OB_ORIGIN`) Detector.
+ * ZERO reliance on synthetic volume! Finds the final opposing candle prior to a verified
+ * BOS/MSS + FVG or institutional displacement leg (`body >= 0.90*ATR && body/range >= 0.55`).
+ */
+export function detectVolumeOrderBlocks(
+  candles: Candle[],
+  lookback = 4,
+  options?: {
+    structures?: InstitutionalStructureEvent[];
+    fvgs?: InstitutionalFairValueGap[];
+    atr?: number;
+  }
+): InstitutionalOrderBlock[] {
+  const obsByTime = new Map<number, InstitutionalOrderBlock>();
+  if (candles.length < lookback + 3) return [];
 
-  for (let i = lookback; i < candles.length - 2; i++) {
-    const c = candles[i];
-    const nxt = candles[i + 1];
-    const after = candles[i + 2];
-    const volPivot = c.volume >= avgVol * 1.15;
+  const atr = Math.max(0.4, options?.atr ?? computeAtr(candles, 14));
+  const structures = options?.structures ?? [];
+  const fvgs = options?.fvgs ?? [];
+  const timeToIdx = new Map<number, number>();
+  for (let i = 0; i < candles.length; i++) timeToIdx.set(candles[i].time, i);
 
-    if (volPivot && c.close < c.open && nxt.close > c.high && after.close >= nxt.open) {
-      const mt50 = round2((Math.max(c.open, c.close) + Math.min(c.open, c.close)) / 2);
-      const mitBar = candles.slice(i + 2).find((f) => f.low <= mt50);
-      obs.push({
-        id: `ob-bull-${c.time}`,
-        direction: 'BULLISH',
-        high: round2(c.high),
-        low: round2(c.low),
-        mt50,
-        volume: c.volume,
-        startTime: c.time,
-        mitigated: Boolean(mitBar),
-        ...(mitBar ? { mitigatedTime: mitBar.time } : {}),
-      });
-    } else if (volPivot && c.close > c.open && nxt.close < c.low && after.close <= nxt.open) {
-      const mt50 = round2((Math.max(c.open, c.close) + Math.min(c.open, c.close)) / 2);
-      const mitBar = candles.slice(i + 2).find((f) => f.high >= mt50);
-      obs.push({
-        id: `ob-bear-${c.time}`,
-        direction: 'BEARISH',
-        high: round2(c.high),
-        low: round2(c.low),
-        mt50,
-        volume: c.volume,
-        startTime: c.time,
-        mitigated: Boolean(mitBar),
-        ...(mitBar ? { mitigatedTime: mitBar.time } : {}),
-      });
+  const addOriginOb = (idx: number, direction: 'BULLISH' | 'BEARISH', linkedToStructure: boolean) => {
+    if (idx < 0 || idx >= candles.length - 2) return;
+    const c = candles[idx];
+    if (obsByTime.has(c.time)) return;
+
+    const mt50 = round2((c.open + c.close) / 2);
+    let mitBar: Candle | undefined;
+    for (let k = idx + 2; k < candles.length; k++) {
+      const f = candles[k];
+      if (direction === 'BULLISH' ? f.low <= mt50 : f.high >= mt50) {
+        mitBar = f;
+        break;
+      }
+    }
+
+    obsByTime.set(c.time, {
+      id: `ob-${direction === 'BULLISH' ? 'bull' : 'bear'}-${c.time}`,
+      direction,
+      high: round2(c.high),
+      low: round2(c.low),
+      mt50,
+      volume: c.volume,
+      startTime: c.time,
+      mitigated: Boolean(mitBar),
+      ...(mitBar ? { mitigatedTime: mitBar.time } : {}),
+      obKind: linkedToStructure ? 'OB_ORIGIN' : 'REJECTION_BLOCK',
+      linkedToStructure,
+    });
+  };
+
+  // Path 1: Final opposing origin candle strictly preceding verified BOS/MSS structure breaks
+  for (const st of structures) {
+    const breakIdx =
+      typeof st.breakBarIndex === 'number'
+        ? st.breakBarIndex
+        : (timeToIdx.get(st.time) ?? -1);
+    if (breakIdx < 2) continue;
+
+    // Walk back 1..5 bars before break to locate the final opposing candle that launched the displacement leg
+    for (let k = breakIdx - 1; k >= Math.max(1, breakIdx - 5); k--) {
+      const c = candles[k];
+      const isOpposing = st.direction === 'BULLISH' ? c.close < c.open : c.close > c.open;
+      if (isOpposing) {
+        addOriginOb(k, st.direction, true);
+        break;
+      }
     }
   }
-  return obs;
+
+  // Path 2: Final opposing origin candle immediately preceding displacement FVG legs
+  for (const fvg of fvgs) {
+    const fvgIdx = timeToIdx.get(fvg.startTime) ?? -1;
+    if (fvgIdx < 1) continue;
+    for (let k = fvgIdx - 1; k >= Math.max(0, fvgIdx - 3); k--) {
+      const c = candles[k];
+      const isOpposing = fvg.direction === 'BULLISH' ? c.close < c.open : c.close > c.open;
+      if (isOpposing) {
+        addOriginOb(k, fvg.direction, Boolean(fvg.createdByBosOrMss));
+        break;
+      }
+    }
+  }
+
+  // Path 3: Pure price-action institutional displacement / rejection origin (no volume dependency)
+  for (let i = lookback; i < candles.length - 2; i++) {
+    const c = candles[i];
+    if (obsByTime.has(c.time)) continue;
+    const nxt = candles[i + 1];
+    const after = candles[i + 2];
+
+    const nxtBody = Math.abs(nxt.close - nxt.open);
+    const nxtRange = Math.max(0.01, nxt.high - nxt.low);
+    const nxtBodyRatio = nxtBody / nxtRange;
+    const strongDisplacement = nxtBody >= atr * 0.9 && nxtBodyRatio >= 0.55;
+
+    if (
+      c.close < c.open &&
+      nxt.close > c.high &&
+      after.close >= nxt.open &&
+      (strongDisplacement || nxt.close - c.low >= atr * 0.9)
+    ) {
+      addOriginOb(i, 'BULLISH', strongDisplacement);
+    } else if (
+      c.close > c.open &&
+      nxt.close < c.low &&
+      after.close <= nxt.open &&
+      (strongDisplacement || c.high - nxt.close >= atr * 0.9)
+    ) {
+      addOriginOb(i, 'BEARISH', strongDisplacement);
+    }
+  }
+
+  return Array.from(obsByTime.values()).sort((a, b) => a.startTime - b.startTime);
 }
 
-export function detectMarketStructure(candles: Candle[], swingLen = 3): StructureEvent[] {
-  const events: StructureEvent[] = [];
-  if (candles.length < swingLen * 2 + 2) return events;
+/**
+ * Module 2 — Multi-Speed Market Structure (BOS / MSS / CHoCH) & Displacement Detector.
+ * - Dual-pivot confirmation: macro swings (left=3, right=2) for H4/H1/M30/M15,
+ *   fast scalping swings (left=2, right=1) for M5/M1. Eliminates 3-bar right-pivot lag.
+ * - Never overwrites lastSwingHigh/Low with the breakout candle's own high/low;
+ *   consumes the broken pivot and waits for the next confirmed fractal pivot.
+ * - Differentiates BOS (trend continuation body close) from MSS (first opposite structural
+ *   break within 12 bars of a verified SWEPT_AND_RECLAIMED liquidity sweep) and CHoCH.
+ * - Computes institutional displacementScore (`body >= 0.90*ATR_14` and `body/range >= 0.55`).
+ */
+export function detectMarketStructure(
+  candles: Candle[],
+  swingLen = 3,
+  options?: {
+    timeframe?: Timeframe;
+    left?: number;
+    right?: number;
+    liquidityPools?: InstitutionalLiquidityPool[];
+    atr?: number;
+  }
+): InstitutionalStructureEvent[] {
+  const events: InstitutionalStructureEvent[] = [];
+  const tf = options?.timeframe;
+  const isFastScalpTf = tf === 'M5' || tf === 'M1' || (!tf && swingLen <= 2);
+  const left = options?.left ?? (isFastScalpTf ? 2 : 3);
+  const right = options?.right ?? (isFastScalpTf ? 1 : 2);
 
-  let lastSwingHigh: number | null = null;
-  let lastSwingHighTime: number | null = null;
-  let lastSwingLow: number | null = null;
-  let lastSwingLowTime: number | null = null;
+  if (candles.length < left + right + 3) return events;
+
+  const atr = Math.max(0.35, options?.atr ?? computeAtr(candles, 14));
+  const sweptPools = (options?.liquidityPools ?? []).filter(
+    (p) => p.sweepStatus === 'SWEPT_AND_RECLAIMED' && typeof p.sweepBarIndex === 'number'
+  );
+
+  let activeSwingHigh: { price: number; time: number; idx: number } | null = null;
+  let activeSwingLow: { price: number; time: number; idx: number } | null = null;
   let trend: 'BULLISH' | 'BEARISH' | 'NEUTRAL' = 'NEUTRAL';
 
-  for (let i = swingLen; i < candles.length - swingLen; i++) {
-    const hi = candles[i].high;
-    const lo = candles[i].low;
+  // Walk chronologically bar-by-bar so pivot at `p = i - right` confirms immediately at bar `i`
+  for (let i = left + right; i < candles.length; i++) {
+    const p = i - right;
+    const pivotBar = candles[p];
     let isSwingHigh = true;
     let isSwingLow = true;
-    for (let j = i - swingLen; j <= i + swingLen; j++) {
-      if (candles[j].high > hi) isSwingHigh = false;
-      if (candles[j].low < lo) isSwingLow = false;
-    }
-    if (isSwingHigh) {
-      lastSwingHigh = hi;
-      lastSwingHighTime = candles[i].time;
-    }
-    if (isSwingLow) {
-      lastSwingLow = lo;
-      lastSwingLowTime = candles[i].time;
+    for (let j = p - left; j <= p + right; j++) {
+      if (j === p) continue;
+      if (candles[j].high >= pivotBar.high) isSwingHigh = false;
+      if (candles[j].low <= pivotBar.low) isSwingLow = false;
     }
 
-    const c = candles[i + swingLen];
-    if (lastSwingHigh !== null && lastSwingHighTime !== null && lastSwingHighTime < c.time && c.close > lastSwingHigh) {
-      const kind: 'BOS' | 'CHoCH' = trend === 'BEARISH' ? 'CHoCH' : 'BOS';
+    if (isSwingHigh) {
+      activeSwingHigh = { price: pivotBar.high, time: pivotBar.time, idx: p };
+    }
+    if (isSwingLow) {
+      activeSwingLow = { price: pivotBar.low, time: pivotBar.time, idx: p };
+    }
+
+    const c = candles[i];
+    const body = Math.abs(c.close - c.open);
+    const range = Math.max(0.01, c.high - c.low);
+    const bodyToAtr = round2(body / atr);
+    const bodyToRange = round2(body / range);
+    const hasInstitutionalDisplacement = body >= 0.9 * atr && bodyToRange >= 0.55;
+    const displacementScore = round2(
+      Math.min(100, Math.max(0, (bodyToAtr / 1.5) * 60 + bodyToRange * 40))
+    );
+
+    // Check Bullish Structural Break (strict body close above confirmed fractal swing high)
+    if (activeSwingHigh !== null && activeSwingHigh.time < c.time && c.close > activeSwingHigh.price) {
+      const recentSslSweep = sweptPools.some(
+        (pool) =>
+          pool.side === 'SSL' &&
+          pool.sweepBarIndex !== undefined &&
+          pool.sweepBarIndex <= i &&
+          i - pool.sweepBarIndex <= 12
+      );
+
+      let kind: 'BOS' | 'CHoCH' = 'BOS';
+      let structureTag: 'BOS' | 'MSS' | 'CHoCH' = 'BOS';
+      if (trend !== 'BULLISH' && recentSslSweep) {
+        kind = 'CHoCH';
+        structureTag = 'MSS';
+      } else if (trend === 'BEARISH') {
+        kind = 'CHoCH';
+        structureTag = 'CHoCH';
+      }
+
+      // Trace verified impulse origin low between broken swing high and breakout bar
+      let originLow = candles[activeSwingHigh.idx].low;
+      let originTime = candles[activeSwingHigh.idx].time;
+      for (let k = activeSwingHigh.idx; k <= i; k++) {
+        if (candles[k].low < originLow) {
+          originLow = candles[k].low;
+          originTime = candles[k].time;
+        }
+      }
+
       events.push({
         id: `str-bull-${c.time}`,
         kind,
+        structureTag,
+        afterLiquiditySweep: recentSslSweep,
         direction: 'BULLISH',
-        level: round2(lastSwingHigh),
+        level: round2(activeSwingHigh.price),
         time: c.time,
-        swingTime: lastSwingHighTime,
+        swingTime: activeSwingHigh.time,
+        displacementScore,
+        bodyToAtr,
+        bodyToRange,
+        hasInstitutionalDisplacement,
+        impulseOriginPrice: round2(originLow),
+        impulseOriginTime: originTime,
+        impulseExtremePrice: round2(c.high),
+        impulseExtremeTime: c.time,
+        breakBarIndex: i,
       });
+
       trend = 'BULLISH';
-      lastSwingHigh = c.high;
-      lastSwingHighTime = c.time;
-    } else if (lastSwingLow !== null && lastSwingLowTime !== null && lastSwingLowTime < c.time && c.close < lastSwingLow) {
-      const kind: 'BOS' | 'CHoCH' = trend === 'BULLISH' ? 'CHoCH' : 'BOS';
+      // CRITICAL FIX: Consume the broken pivot; NEVER overwrite with breakout candle's own high!
+      activeSwingHigh = null;
+    } else if (activeSwingLow !== null && activeSwingLow.time < c.time && c.close < activeSwingLow.price) {
+      const recentBslSweep = sweptPools.some(
+        (pool) =>
+          pool.side === 'BSL' &&
+          pool.sweepBarIndex !== undefined &&
+          pool.sweepBarIndex <= i &&
+          i - pool.sweepBarIndex <= 12
+      );
+
+      let kind: 'BOS' | 'CHoCH' = 'BOS';
+      let structureTag: 'BOS' | 'MSS' | 'CHoCH' = 'BOS';
+      if (trend !== 'BEARISH' && recentBslSweep) {
+        kind = 'CHoCH';
+        structureTag = 'MSS';
+      } else if (trend === 'BULLISH') {
+        kind = 'CHoCH';
+        structureTag = 'CHoCH';
+      }
+
+      let originHigh = candles[activeSwingLow.idx].high;
+      let originTime = candles[activeSwingLow.idx].time;
+      for (let k = activeSwingLow.idx; k <= i; k++) {
+        if (candles[k].high > originHigh) {
+          originHigh = candles[k].high;
+          originTime = candles[k].time;
+        }
+      }
+
       events.push({
         id: `str-bear-${c.time}`,
         kind,
+        structureTag,
+        afterLiquiditySweep: recentBslSweep,
         direction: 'BEARISH',
-        level: round2(lastSwingLow),
+        level: round2(activeSwingLow.price),
         time: c.time,
-        swingTime: lastSwingLowTime,
+        swingTime: activeSwingLow.time,
+        displacementScore,
+        bodyToAtr,
+        bodyToRange,
+        hasInstitutionalDisplacement,
+        impulseOriginPrice: round2(originHigh),
+        impulseOriginTime: originTime,
+        impulseExtremePrice: round2(c.low),
+        impulseExtremeTime: c.time,
+        breakBarIndex: i,
       });
+
       trend = 'BEARISH';
-      lastSwingLow = c.low;
-      lastSwingLowTime = c.time;
+      // CRITICAL FIX: Consume the broken pivot; NEVER overwrite with breakout candle's own low!
+      activeSwingLow = null;
     }
   }
+
   return events;
 }
 
-export function detectLiquidityPools(candles: Candle[]): LiquidityPool[] {
-  if (candles.length < 20) return [];
-  const slice = candles.slice(-60);
-  const prior = slice.slice(0, -3);
-  const recent = slice.slice(-3);
-  let maxH = prior[0];
-  let minL = prior[0];
-  for (const c of prior) {
-    if (c.high > maxH.high) maxH = c;
-    if (c.low < minL.low) minL = c;
+/**
+ * Module 1 — True Institutional & Session Liquidity Map (`LIQ`).
+ * - Exact UTC Session High/Low pools: Asian (00:00–07:00), London (07:00–12:00), NY (12:00–20:00)
+ * - Previous Day High/Low (PDH / PDL)
+ * - Structural Equal Highs (EQH) & Equal Lows (EQL): ATR-scaled tolerance (0.12 * ATR_14),
+ *   >= 2 distinct swing touches separated by >= 4 bars, zero intermediate violation.
+ * - Strict Sweep vs. Breakout Rule via `evaluateLiquidityPoolSweep`:
+ *   `SWEPT_AND_RECLAIMED` vs `STRUCTURAL_BREAKOUT` vs `UNTOUCHED`.
+ */
+export function detectLiquidityPools(
+  candles: Candle[],
+  options?: { atr?: number }
+): InstitutionalLiquidityPool[] {
+  if (candles.length < 16) return [];
+
+  const atr = Math.max(0.35, options?.atr ?? computeAtr(candles, 14));
+  const eqTol = Math.max(0.08, atr * 0.12);
+  const pools: InstitutionalLiquidityPool[] = [];
+
+  const addEvaluatedPool = (params: {
+    id: string;
+    side: 'BSL' | 'SSL';
+    level: number;
+    time: number;
+    formationIdx: number;
+    poolKind: LiquidityPoolKind;
+    touches?: number;
+  }) => {
+    const evalRes = evaluateLiquidityPoolSweep(
+      candles,
+      params.formationIdx,
+      params.side,
+      params.level,
+      atr
+    );
+    pools.push({
+      id: params.id,
+      side: params.side,
+      level: round2(params.level),
+      time: params.time,
+      swept: evalRes.swept,
+      sweepRejected: evalRes.sweepRejected,
+      sweepStatus: evalRes.sweepStatus,
+      ...(evalRes.sweepTime !== undefined ? { sweepTime: evalRes.sweepTime } : {}),
+      ...(evalRes.sweepBarIndex !== undefined ? { sweepBarIndex: evalRes.sweepBarIndex } : {}),
+      rejectionWickRatio: evalRes.rejectionWickRatio,
+      poolKind: params.poolKind,
+      touches: params.touches ?? 1,
+    });
+  };
+
+  // 1. Exact UTC Session High / Low Pools: Asian (00–07), London (07–12), NY (12–20)
+  type SessionBucketName = 'ASIAN' | 'LONDON' | 'NY';
+  const sessionStats = new Map<
+    string,
+    {
+      session: SessionBucketName;
+      dayKey: number;
+      high: number;
+      highTime: number;
+      highIdx: number;
+      low: number;
+      lowTime: number;
+      lowIdx: number;
+      endIdx: number;
+    }
+  >();
+
+  for (let i = 0; i < candles.length; i++) {
+    const c = candles[i];
+    const secOfDay = ((c.time % 86400) + 86400) % 86400;
+    const hourUtc = Math.floor(secOfDay / 3600);
+    const dayKey = Math.floor(c.time / 86400);
+
+    let session: SessionBucketName | null = null;
+    if (hourUtc >= 0 && hourUtc < 7) session = 'ASIAN';
+    else if (hourUtc >= 7 && hourUtc < 12) session = 'LONDON';
+    else if (hourUtc >= 12 && hourUtc < 20) session = 'NY';
+    if (!session) continue;
+
+    const key = `${dayKey}-${session}`;
+    const prev = sessionStats.get(key);
+    if (!prev) {
+      sessionStats.set(key, {
+        session,
+        dayKey,
+        high: c.high,
+        highTime: c.time,
+        highIdx: i,
+        low: c.low,
+        lowTime: c.time,
+        lowIdx: i,
+        endIdx: i,
+      });
+    } else {
+      if (c.high > prev.high) {
+        prev.high = c.high;
+        prev.highTime = c.time;
+        prev.highIdx = i;
+      }
+      if (c.low < prev.low) {
+        prev.low = c.low;
+        prev.lowTime = c.time;
+        prev.lowIdx = i;
+      }
+      prev.endIdx = i;
+    }
   }
-  const bslSwept = recent.some((c) => c.high > maxH.high);
-  const sslSwept = recent.some((c) => c.low < minL.low);
-  return [
-    {
-      id: `liq-bsl-${maxH.time}`,
+
+  for (const sessionName of ['ASIAN', 'LONDON', 'NY'] as SessionBucketName[]) {
+    const matching = Array.from(sessionStats.values())
+      .filter((s) => s.session === sessionName && s.endIdx < candles.length - 1)
+      .sort((a, b) => b.dayKey - a.dayKey);
+    const latest = matching[0];
+    if (!latest) continue;
+
+    addEvaluatedPool({
+      id: `liq-${sessionName.toLowerCase()}-hi-${latest.highTime}`,
       side: 'BSL',
-      level: round2(maxH.high),
-      time: maxH.time,
-      swept: bslSwept,
-    },
-    {
-      id: `liq-ssl-${minL.time}`,
+      level: latest.high,
+      time: latest.highTime,
+      formationIdx: latest.endIdx,
+      poolKind: `${sessionName}_HIGH` as LiquidityPoolKind,
+    });
+    addEvaluatedPool({
+      id: `liq-${sessionName.toLowerCase()}-lo-${latest.lowTime}`,
       side: 'SSL',
-      level: round2(minL.low),
-      time: minL.time,
-      swept: sslSwept,
-    },
-  ];
+      level: latest.low,
+      time: latest.lowTime,
+      formationIdx: latest.endIdx,
+      poolKind: `${sessionName}_LOW` as LiquidityPoolKind,
+    });
+  }
+
+  // 2. Previous Day High / Low (PDH / PDL) using UTC calendar day boundaries
+  const latestDay = Math.floor(candles[candles.length - 1].time / 86400);
+  let prevDay = -1;
+  for (let i = candles.length - 1; i >= 0; i--) {
+    const dk = Math.floor(candles[i].time / 86400);
+    if (dk < latestDay) {
+      prevDay = dk;
+      break;
+    }
+  }
+  if (prevDay >= 0) {
+    let pdh = -Infinity;
+    let pdhTime = 0;
+    let pdl = Infinity;
+    let pdlTime = 0;
+    let prevDayEndIdx = -1;
+    for (let i = 0; i < candles.length; i++) {
+      if (Math.floor(candles[i].time / 86400) === prevDay) {
+        if (candles[i].high > pdh) {
+          pdh = candles[i].high;
+          pdhTime = candles[i].time;
+        }
+        if (candles[i].low < pdl) {
+          pdl = candles[i].low;
+          pdlTime = candles[i].time;
+        }
+        prevDayEndIdx = i;
+      }
+    }
+    if (prevDayEndIdx >= 0 && Number.isFinite(pdh) && Number.isFinite(pdl)) {
+      addEvaluatedPool({
+        id: `liq-pdh-${pdhTime}`,
+        side: 'BSL',
+        level: pdh,
+        time: pdhTime,
+        formationIdx: prevDayEndIdx,
+        poolKind: 'PDH',
+      });
+      addEvaluatedPool({
+        id: `liq-pdl-${pdlTime}`,
+        side: 'SSL',
+        level: pdl,
+        time: pdlTime,
+        formationIdx: prevDayEndIdx,
+        poolKind: 'PDL',
+      });
+    }
+  }
+
+  // 3. Structural Equal Highs (EQH) & Equal Lows (EQL)
+  // ATR-scaled clustering (tolerance = 0.12 * ATR_14), >= 2 swing touches separated by >= 4 bars, no intermediate violation
+  const swingHighs: Array<{ idx: number; price: number; time: number }> = [];
+  const swingLows: Array<{ idx: number; price: number; time: number }> = [];
+  const scanStart = Math.max(2, candles.length - 90);
+  for (let i = scanStart; i < candles.length - 1; i++) {
+    const hi = candles[i].high;
+    const lo = candles[i].low;
+    const isH =
+      hi >= candles[i - 1].high &&
+      hi >= candles[i - 2].high &&
+      hi >= candles[i + 1].high;
+    const isL =
+      lo <= candles[i - 1].low &&
+      lo <= candles[i - 2].low &&
+      lo <= candles[i + 1].low;
+    if (isH) swingHighs.push({ idx: i, price: hi, time: candles[i].time });
+    if (isL) swingLows.push({ idx: i, price: lo, time: candles[i].time });
+  }
+
+  // Cluster Equal Highs (no intermediate bar exceeding max(p1, p2) + eqTol)
+  const usedHighIndices = new Set<number>();
+  for (let a = 0; a < swingHighs.length; a++) {
+    if (usedHighIndices.has(a)) continue;
+    const cluster = [swingHighs[a]];
+    for (let b = a + 1; b < swingHighs.length; b++) {
+      const prevTouch = cluster[cluster.length - 1];
+      const cand = swingHighs[b];
+      if (cand.idx - prevTouch.idx < 4) continue;
+      if (Math.abs(cand.price - cluster[0].price) > eqTol) continue;
+
+      const ceiling = Math.max(prevTouch.price, cand.price) + eqTol;
+      let violated = false;
+      for (let m = prevTouch.idx + 1; m < cand.idx; m++) {
+        if (candles[m].high > ceiling) {
+          violated = true;
+          break;
+        }
+      }
+      if (!violated) {
+        cluster.push(cand);
+        usedHighIndices.add(b);
+      }
+    }
+    if (cluster.length >= 2) {
+      const lastTouch = cluster[cluster.length - 1];
+      const avgLevel = cluster.reduce((s, x) => s + x.price, 0) / cluster.length;
+      addEvaluatedPool({
+        id: `liq-eqh-${lastTouch.time}`,
+        side: 'BSL',
+        level: avgLevel,
+        time: lastTouch.time,
+        formationIdx: lastTouch.idx,
+        poolKind: 'EQH',
+        touches: cluster.length,
+      });
+    }
+  }
+
+  // Cluster Equal Lows (no intermediate bar breaching min(p1, p2) - eqTol)
+  const usedLowIndices = new Set<number>();
+  for (let a = 0; a < swingLows.length; a++) {
+    if (usedLowIndices.has(a)) continue;
+    const cluster = [swingLows[a]];
+    for (let b = a + 1; b < swingLows.length; b++) {
+      const prevTouch = cluster[cluster.length - 1];
+      const cand = swingLows[b];
+      if (cand.idx - prevTouch.idx < 4) continue;
+      if (Math.abs(cand.price - cluster[0].price) > eqTol) continue;
+
+      const floor = Math.min(prevTouch.price, cand.price) - eqTol;
+      let violated = false;
+      for (let m = prevTouch.idx + 1; m < cand.idx; m++) {
+        if (candles[m].low < floor) {
+          violated = true;
+          break;
+        }
+      }
+      if (!violated) {
+        cluster.push(cand);
+        usedLowIndices.add(b);
+      }
+    }
+    if (cluster.length >= 2) {
+      const lastTouch = cluster[cluster.length - 1];
+      const avgLevel = cluster.reduce((s, x) => s + x.price, 0) / cluster.length;
+      addEvaluatedPool({
+        id: `liq-eql-${lastTouch.time}`,
+        side: 'SSL',
+        level: avgLevel,
+        time: lastTouch.time,
+        formationIdx: lastTouch.idx,
+        poolKind: 'EQL',
+        touches: cluster.length,
+      });
+    }
+  }
+
+  // 4. Fallback prior swing BSL/SSL if series is short or missing either side
+  const hasBsl = pools.some((p) => p.side === 'BSL');
+  const hasSsl = pools.some((p) => p.side === 'SSL');
+  if (!hasBsl || !hasSsl) {
+    const sliceStart = Math.max(0, candles.length - 60);
+    const priorEnd = Math.max(sliceStart + 1, candles.length - 3);
+    let maxIdx = sliceStart;
+    let minIdx = sliceStart;
+    for (let i = sliceStart + 1; i < priorEnd; i++) {
+      if (candles[i].high > candles[maxIdx].high) maxIdx = i;
+      if (candles[i].low < candles[minIdx].low) minIdx = i;
+    }
+    if (!hasBsl) {
+      addEvaluatedPool({
+        id: `liq-bsl-${candles[maxIdx].time}`,
+        side: 'BSL',
+        level: candles[maxIdx].high,
+        time: candles[maxIdx].time,
+        formationIdx: maxIdx,
+        poolKind: 'SWING_BSL',
+      });
+    }
+    if (!hasSsl) {
+      addEvaluatedPool({
+        id: `liq-ssl-${candles[minIdx].time}`,
+        side: 'SSL',
+        level: candles[minIdx].low,
+        time: candles[minIdx].time,
+        formationIdx: minIdx,
+        poolKind: 'SWING_SSL',
+      });
+    }
+  }
+
+  // Always preserve institutional Session (Asian/London/NY) & PDH/PDL pools, plus most recent EQH/EQL/swing pools
+  const primaryPools: InstitutionalLiquidityPool[] = [];
+  const secondaryPools: InstitutionalLiquidityPool[] = [];
+  for (const p of pools) {
+    if (
+      p.poolKind === 'ASIAN_HIGH' ||
+      p.poolKind === 'ASIAN_LOW' ||
+      p.poolKind === 'LONDON_HIGH' ||
+      p.poolKind === 'LONDON_LOW' ||
+      p.poolKind === 'NY_HIGH' ||
+      p.poolKind === 'NY_LOW' ||
+      p.poolKind === 'PDH' ||
+      p.poolKind === 'PDL'
+    ) {
+      primaryPools.push(p);
+    } else {
+      secondaryPools.push(p);
+    }
+  }
+  return [...primaryPools, ...secondaryPools.slice(-6)];
 }
 
 export function computeTfsSuite(candles: Candle[], lookback = 20): TfsSnapshot {
@@ -435,51 +1007,80 @@ export function analyzeQuantSnapshot(
     agentConfig?: Partial<AgentConfig>;
     newsShock?: { detected: boolean; headline?: string | null };
   }
-): QuantSnapshot {
+): QuantSnapshot & { brain: SniperPayamBrainReport; dealingRange: InstitutionalDealingRangeSnapshot } {
   const t0 = performance.now();
   const active = candlesByTf[timeframe] ?? [];
   const regime = classifyRegime(active);
-  const atrGapFloor = Math.max(0.35, round2(regime.atr * 0.14));
 
-  const rawFvgs = detectLuxAlgoFvgs(active, atrGapFloor);
-  const enrichedFvgs = enrichFairValueGaps(active, rawFvgs, regime.atr);
-  const fvgs = enrichedFvgs.slice(-8);
-
-  const rawObs = detectVolumeOrderBlocks(active);
-  const enrichedObs = enrichOrderBlocks(active, rawObs, enrichedFvgs, regime.atr);
-  const orderBlocks = enrichedObs.slice(-6);
-
-  const structures = detectMarketStructure(active).slice(-8);
-  const rawLiquidity = detectLiquidityPools(active);
-  const sweepFootprint = detectLiquiditySweepFootprint(active, rawLiquidity);
-  const liquidity = sweepFootprint.enrichedLiquidity;
-
-  const tfs = computeTfsSuite(active);
-  const tpi = computeTpiMatrix(candlesByTf);
-  const rsi = computeRsiSnapshot(timeframe, candlesByTf);
-  const dealingRange = computeDealingRange(timeframe, active);
-
-  // Multi-timeframe structural context for 4H -> 1H -> 15M -> 5M top-down synthesis
+  // Compute all 6 institutional timeframes with strict dependency order: LIQ -> BOS/MSS -> FVG/CE -> OB_ORIGIN -> TFS
   const allTfs: Timeframe[] = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4'];
-  const structuresByTf = {} as Record<Timeframe, StructureEvent[]>;
-  const obsByTf = {} as Record<Timeframe, OrderBlock[]>;
-  const fvgsByTf = {} as Record<Timeframe, FairValueGap[]>;
+  const structuresByTf = {} as Record<Timeframe, InstitutionalStructureEvent[]>;
+  const obsByTf = {} as Record<Timeframe, InstitutionalOrderBlock[]>;
+  const fvgsByTf = {} as Record<Timeframe, InstitutionalFairValueGap[]>;
+  const liquidityByTf = {} as Record<Timeframe, InstitutionalLiquidityPool[]>;
+  const tfsByTf = {} as Record<Timeframe, TfsSnapshot>;
 
   for (const tf of allTfs) {
-    if (tf === timeframe) {
-      structuresByTf[tf] = structures;
-      obsByTf[tf] = orderBlocks;
-      fvgsByTf[tf] = fvgs;
-    } else {
-      const series = candlesByTf[tf] ?? [];
-      const tfAtr = computeAtr(series);
-      const tfFvgs = enrichFairValueGaps(series, detectLuxAlgoFvgs(series, Math.max(0.35, tfAtr * 0.14)), tfAtr).slice(-6);
-      const tfObs = enrichOrderBlocks(series, detectVolumeOrderBlocks(series), tfFvgs, tfAtr).slice(-5);
-      structuresByTf[tf] = detectMarketStructure(series).slice(-6);
-      fvgsByTf[tf] = tfFvgs;
-      obsByTf[tf] = tfObs;
-    }
+    const series = candlesByTf[tf] ?? [];
+    const tfAtr = tf === timeframe ? regime.atr : computeAtr(series, 14);
+    const tfGapFloor = Math.max(0.3, round2(tfAtr * 0.15));
+
+    const tfLiq = detectLiquidityPools(series, { atr: tfAtr });
+
+    const tfStructures = detectMarketStructure(series, tf === 'M1' || tf === 'M5' ? 2 : 3, {
+      timeframe: tf,
+      liquidityPools: tfLiq,
+      atr: tfAtr,
+    }).slice(tf === timeframe ? -8 : -6);
+
+    const tfRawFvgs = detectLuxAlgoFvgs(series, tfGapFloor);
+    const tfFvgs = enrichFairValueGaps(series, tfRawFvgs, tfAtr, tfStructures).slice(
+      tf === timeframe ? -8 : -6
+    );
+
+    const tfRawObs = detectVolumeOrderBlocks(series, 4, {
+      structures: tfStructures,
+      fvgs: tfFvgs,
+      atr: tfAtr,
+    });
+    const tfObs = enrichOrderBlocks(series, tfRawObs, tfFvgs, tfAtr, tfStructures, tfLiq).slice(
+      tf === timeframe ? -6 : -5
+    );
+
+    liquidityByTf[tf] = tfLiq;
+    structuresByTf[tf] = tfStructures;
+    fvgsByTf[tf] = tfFvgs;
+    obsByTf[tf] = tfObs;
+    tfsByTf[tf] = computeTfsSuite(series);
   }
+
+  const fvgs = fvgsByTf[timeframe];
+  const orderBlocks = obsByTf[timeframe];
+  const structures = structuresByTf[timeframe];
+  const liquidity = liquidityByTf[timeframe];
+  const tfs = tfsByTf[timeframe];
+
+  const tpi = computeTpiMatrix(candlesByTf);
+  const rsi = computeRsiSnapshot(timeframe, candlesByTf);
+
+  // Module 4: True Impulse-Anchored OTE anchored to verified BOS/MSS impulse leg on active TF (or M15/M5)
+  const impulseAnchorTf: Timeframe =
+    structures.length > 0
+      ? timeframe
+      : (structuresByTf.M15?.length ?? 0) > 0
+        ? 'M15'
+        : (structuresByTf.M5?.length ?? 0) > 0
+          ? 'M5'
+          : timeframe;
+  const anchorSeries = candlesByTf[impulseAnchorTf] ?? active;
+  const dealingRange = computeDealingRange(timeframe, anchorSeries, 48, {
+    structures: structuresByTf[impulseAnchorTf],
+    liquidity: liquidityByTf[impulseAnchorTf],
+    fvgs: fvgsByTf[impulseAnchorTf],
+    orderBlocks: obsByTf[impulseAnchorTf],
+    scalpingFvgs: [...(fvgsByTf.M15 ?? []), ...(fvgsByTf.M5 ?? [])],
+    scalpingObs: [...(obsByTf.M15 ?? []), ...(obsByTf.M5 ?? [])],
+  });
 
   const brain = evaluatePayamBrain({
     executionTimeframe: timeframe,
@@ -495,6 +1096,8 @@ export function analyzeQuantSnapshot(
     structuresByTf,
     obsByTf,
     fvgsByTf,
+    tfsByTf,
+    liquidityByTf,
     newsGate: context?.newsGate,
     basis: context?.basis,
     spread: context?.spread ?? 0.24,
@@ -524,8 +1127,8 @@ export function analyzeQuantSnapshot(
 /**
  * Strict mathematical guardrails (non-bypassable):
  * 1) LONG: SL < Entry < TP1 < TP2 ; SHORT: SL > Entry > TP1 > TP2
- * 2) R:R = |TP1 - Entry| / |Entry - SL| >= 1.50
- * 3) |Entry - SL| >= 0.25 * ATR
+ * 2) R:R = |TP1 - Entry| / |Entry - SL| >= dynamic minRrRatio (default 1.50)
+ * 3) |Entry - SL| >= dynamic minStopDist (default 0.25 * ATR)
  */
 export function validateTradeGuardrails(
   direction: 'LONG' | 'SHORT',
@@ -533,7 +1136,8 @@ export function validateTradeGuardrails(
   stopLoss: number,
   tp1: number,
   tp2: number,
-  atr: number
+  atr: number,
+  options?: { minRrRatio?: number; minStopDist?: number }
 ): GuardrailResult {
   const errors: string[] = [];
 
@@ -549,18 +1153,27 @@ export function validateTradeGuardrails(
     }
   }
 
+  const effectiveMinRr =
+    typeof options?.minRrRatio === 'number' && Number.isFinite(options.minRrRatio) && options.minRrRatio > 0
+      ? options.minRrRatio
+      : MIN_RR_RATIO;
+
   const stopDistance = Math.abs(entry - stopLoss);
   const rewardDistance = Math.abs(tp1 - entry);
   const rrRatio = stopDistance > 0 ? round3(rewardDistance / stopDistance) : 0;
 
-  if (rrRatio < MIN_RR_RATIO) {
-    errors.push(`R:R ratio ${rrRatio.toFixed(2)} is below institutional minimum ${MIN_RR_RATIO.toFixed(2)}`);
+  if (rrRatio < effectiveMinRr) {
+    errors.push(`R:R ratio ${rrRatio.toFixed(2)} is below institutional minimum ${effectiveMinRr.toFixed(2)}`);
   }
 
-  const minStopRequired = round3(MIN_ATR_STOP_MULT * atr);
+  const minStopRequired =
+    typeof options?.minStopDist === 'number' && Number.isFinite(options.minStopDist) && options.minStopDist >= 0
+      ? round3(options.minStopDist)
+      : round3(MIN_ATR_STOP_MULT * atr);
+
   if (stopDistance < minStopRequired) {
     errors.push(
-      `Stop distance $${stopDistance.toFixed(2)} is tighter than 0.25 × ATR ($${minStopRequired.toFixed(2)})`
+      `Stop distance $${stopDistance.toFixed(2)} is tighter than minimum structural stop floor ($${minStopRequired.toFixed(2)})`
     );
   }
 
@@ -1053,15 +1666,15 @@ export function generateQuantProposal(
   newsGate: NewsGateStatus,
   divergence: BasisDivergence,
   variantIndex = 0,
-  options?: { allowCautionVariant?: boolean; spread?: number; minRrRatio?: number }
-): AgentProposal | null {
+  options?: { allowCautionVariant?: boolean; spread?: number; minRrRatio?: number; atrByTf?: Partial<Record<Timeframe, number>> }
+): SniperAgentProposal | null {
   return buildInstitutionalProposalFromBrain({
     spotPrice,
     timeframe,
-    brain: quant.brain,
-    orderBlocks: quant.orderBlocks,
-    fvgs: quant.fvgs,
-    liquidity: quant.liquidity,
+    brain: quant.brain as SniperPayamBrainReport,
+    orderBlocks: quant.orderBlocks as InstitutionalOrderBlock[],
+    fvgs: quant.fvgs as InstitutionalFairValueGap[],
+    liquidity: quant.liquidity as InstitutionalLiquidityPool[],
     atr: quant.regime.atr,
     spread: options?.spread ?? 0.24,
     newsGate,
@@ -1070,6 +1683,7 @@ export function generateQuantProposal(
     variantIndex,
     allowCautionVariant: options?.allowCautionVariant ?? false,
     minRrRatio: options?.minRrRatio ?? 1.75,
+    atrByTf: options?.atrByTf,
   });
 }
 
