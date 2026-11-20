@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$1" = "purge" ]; then
-  rm -rf /opt/xauusd-agy-advisor/.venv /opt/xauusd-agy-advisor/cache
-  echo "[xauusd-aurum-deck] Purged runtime cache and virtualenv (trading.db preserved unless manually removed)."
+if [ "${1:-}" = "purge" ]; then
+  rm -rf /opt/xauusd-aurum-deck/logs /opt/xauusd-aurum-deck/node_modules
+  echo "[xauusd-aurum-deck] Purged runtime logs and node_modules (/etc/xauusd-aurum-deck/env preserved)."
 fi
 
 if [ -d /run/systemd/system ]; then

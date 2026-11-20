@@ -24,9 +24,36 @@ except ImportError:  # pragma: no cover - lightweight fallback when mcp not inst
             raise RuntimeError("Install 'mcp' package to run stdio FastMCP server.")
 
 
-from methods.risk_cost import validate_trade_guardrails
+def validate_trade_guardrails(
+    direction: str,
+    entry: float,
+    stop_loss: float,
+    tp1: float,
+    tp2: float,
+    atr: float = 3.5,
+) -> dict[str, Any]:
+    """Deterministic System-1 R:R and stop-distance guardrail check (mirrored from TS engine)."""
+    errors: list[str] = []
+    d = direction.upper()
+    stop_dist = abs(entry - stop_loss)
+    min_stop = max(1.8, atr * 0.8)
+    if d == "LONG":
+        if not (stop_loss < entry < tp1 < tp2):
+            errors.append("LONG invariant violated: stopLoss < entry < tp1 < tp2 required.")
+        reward = tp1 - entry
+    else:
+        if not (stop_loss > entry > tp1 > tp2):
+            errors.append("SHORT invariant violated: stopLoss > entry > tp1 > tp2 required.")
+        reward = entry - tp1
+    rr = round(reward / max(stop_dist, 1e-6), 2)
+    if stop_dist < min_stop:
+        errors.append(f"Stop distance ${stop_dist:.2f} below ATR floor ${min_stop:.2f}.")
+    if rr < 1.5:
+        errors.append(f"R:R {rr:.2f} below institutional floor 1.50.")
+    return {"valid": len(errors) == 0, "rr_ratio": rr, "stop_distance": round(stop_dist, 2), "errors": errors}
 
-SENTINEL_URL = os.getenv("XAUUSD_SENTINEL_URL", "http://127.0.0.1:8787")
+
+SENTINEL_URL = os.getenv("XAUUSD_DECK_URL", os.getenv("XAUUSD_SENTINEL_URL", "http://127.0.0.1:3000"))
 mcp = FastMCP("Payam XAUUSD Institutional Brain & Governance MCP")
 
 

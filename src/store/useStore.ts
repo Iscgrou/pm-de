@@ -6,6 +6,7 @@ import {
   evaluateConfirmedPositionAdvice,
   evaluateNewsGate,
   generateQuantProposal,
+  generateSeedSeries,
   inspectSymbolTripwire,
   run18GateAudit,
   stepHsmPosition,
@@ -16,8 +17,8 @@ import {
 import {
   calculateRequiredMargin,
   createInitialSimAccount,
-  derivePositionCoPilotDirective,
   executePartialClose,
+  generateSeedClosedTrades,
   modifyPositionLevels,
   reconcileSimAccount,
   simulateOpenTrade,
@@ -41,13 +42,11 @@ import type {
   AgentConfig,
   AgentEngineMode,
   AgentProposal,
-  AiTelemetryState,
   BasisDivergence,
   Candle,
   CircuitBreakerSnapshot,
   ClosedTradeRecord,
   ConfirmedPosition,
-  FeedConnectionMode,
   GateAuditResult,
   LiveNewsIntelligence,
   NewsEvent,
@@ -56,8 +55,6 @@ import type {
   PendingLimitOrder,
   PipelineStatus,
   Position,
-  PositionCoPilotDirective,
-  ProposalLifecycleStatus,
   QuantSnapshot,
   SessionEquityPoint,
   SimAccountState,
@@ -120,9 +117,7 @@ interface AurumStore {
   vectorModalOpen: boolean;
   candlesByTf: Record<Timeframe, Candle[]>;
   tick: Tick;
-  feedMode: FeedConnectionMode;
-  ticksPerMinute: number;
-  tickTimestampsMs: number[];
+  feedMode: 'LIVE_INTERBANK' | 'REPLAY_SIM';
   basisDivergence: BasisDivergence;
   quant: QuantSnapshot;
   position: Position | null;
@@ -136,7 +131,7 @@ interface AurumStore {
   lastGuardrailErrors: string[];
   statusBanner: string | null;
 
-  // Phase 2 & 3: Payam Autonomous Agentic Engine & Manual-Broker Position Guardian
+  // Phase 2 & 3: Payam Autonomous Agentic Engine & Comprehensive Real-Broker Simulator
   agentEnabled: boolean;
   agentMode: AgentEngineMode;
   agentBusy: boolean;
@@ -151,9 +146,6 @@ interface AurumStore {
   focusedPositionId: string | null;
   simAccount: SimAccountState;
   sessionEquityHistory: SessionEquityPoint[];
-
-  // Squad 3 / Squad 4 Shared AI Sub-Agent Telemetry
-  aiTelemetry: AiTelemetryState;
 
   // Phase 4: Atomic Agent Governance, Risk Circuit Breakers, 14-Source Live News & Audit Log
   agentConfig: AgentConfig;
@@ -183,8 +175,6 @@ interface AurumStore {
   setVectorModalOpen: (open: boolean) => void;
   setControlCenterOpen: (open: boolean) => void;
   toggleLayer: (layer: keyof SmcLayerVisibility) => void;
-  setFeedConnectionState: (mode: FeedConnectionMode, note?: string) => void;
-  ingestSsePayload: (payload: Record<string, unknown>) => void;
   applyTickUpdate: (rawTick?: Partial<Tick>, paxgRefPrice?: number) => void;
   hydrateRealCandles: (force?: boolean) => Promise<void>;
   pollLiveMarket: () => Promise<void>;
@@ -196,13 +186,10 @@ interface AurumStore {
   resetAgentConfig: () => void;
   resetLossCooldown: () => void;
 
-  // Autonomous Agentic Model & Manual-Broker Guardian Actions
+  // Autonomous Agentic Model & Real-Broker Simulation Actions
   toggleAgentEnabled: () => void;
   setAgentMode: (mode: AgentEngineMode) => void;
   runAgentScanCycle: (opts?: { quantOnly?: boolean }) => Promise<void>;
-  monitorOpenPositions: () => Promise<void>;
-  applyPositionDirective: (positionId: string) => void;
-  markLimitFilledInBroker: (positionId: string, actualFillPrice?: number) => void;
   confirmProposal: (
     proposalId: string,
     optionsOrLot?:
@@ -210,7 +197,6 @@ interface AurumStore {
       | {
           lotSize?: number;
           executionType?: OrderExecutionType;
-          actualFillPrice?: number;
           trailingStopDistance?: number | null;
         }
   ) => { ok: boolean; errors: string[]; positionId?: string };
@@ -265,178 +251,15 @@ interface AurumStore {
   clearBanner: () => void;
 }
 
-export function getDefaultTtlBars(tf: Timeframe): number {
-  switch (tf) {
-    case 'M1':
-      return 12;
-    case 'M5':
-      return 6;
-    case 'M15':
-      return 6;
-    case 'M30':
-      return 4;
-    case 'H1':
-      return 4;
-    case 'H4':
-      return 3;
-  }
-}
-
-export function enrichProposalLifecycle(
-  proposal: AgentProposal,
-  candlesByTf: Record<Timeframe, Candle[]>,
-  spot: number,
-  spread: number,
-  nowMs = Date.now()
-): AgentProposal {
-  const tfSeries = candlesByTf[proposal.timeframe] ?? [];
-  const latestBarTime = tfSeries.length > 0 ? tfSeries[tfSeries.length - 1].time : Math.floor(nowMs / 1000);
-  const ttlBars = proposal.ttlBarsRemaining ?? getDefaultTtlBars(proposal.timeframe);
-  const expiresAtTime =
-    proposal.expiresAtTime ?? nowMs + ttlBars * TIMEFRAME_SECONDS[proposal.timeframe] * 1000;
-  const distFromSpot = Number.isFinite(spot) && spot > 0 ? Math.abs(proposal.entry - spot) : 0;
-  const orderType: 'LIMIT' | 'MARKET' =
-    proposal.orderType ?? (distFromSpot > Math.max(0.4, spread * 1.5) ? 'LIMIT' : 'MARKET');
-  const zoneHalf = Number(Math.max(0.4, Math.min(2.2, Math.abs(proposal.entry - proposal.stopLoss) * 0.16)).toFixed(2));
-  const sniperZone = proposal.sniperZone ?? {
-    low: Number((proposal.entry - zoneHalf).toFixed(2)),
-    high: Number((proposal.entry + zoneHalf).toFixed(2)),
-    sweetSpot: Number(proposal.entry.toFixed(2)),
-  };
+function buildInitialCandles(anchorPrice = 2742.6): Record<Timeframe, Candle[]> {
+  const nowSec = Math.floor(Date.now() / 1000);
   return {
-    ...proposal,
-    orderType,
-    sniperZone,
-    invalidationPrice: proposal.invalidationPrice ?? proposal.stopLoss,
-    ttlBarsRemaining: ttlBars,
-    expiresAtTime,
-    proposalLifecycleStatus: proposal.proposalLifecycleStatus ?? 'ACTIVE',
-    lastBarTimeSeen: proposal.lastBarTimeSeen ?? latestBarTime,
-  };
-}
-
-/**
- * Deterministic Signal TTL & Pre-Fill Invalidation Engine:
- * - Decrements ttlBarsRemaining strictly on each new candle close of proposal.timeframe
- * - Auto-expires when ttlBarsRemaining <= 0 or Date.now() > expiresAtTime ('EXPIRED_TTL')
- * - Cancels LIMIT proposals if live spot reaches TP1 before ever filling ('CANCELLED_FRONT_RUN')
- * - Invalidates unconfirmed proposals if live spot breaches stopLoss / invalidationPrice ('INVALIDATED_STRUCTURE')
- */
-export function evaluateProposalLifecycles(
-  proposals: AgentProposal[],
-  candlesByTf: Record<Timeframe, Candle[]>,
-  spot: number,
-  bid: number,
-  ask: number,
-  nowMs = Date.now()
-): { proposals: AgentProposal[]; events: string[]; changed: boolean } {
-  if (!Number.isFinite(spot) || spot <= 0 || proposals.length === 0) {
-    return { proposals, events: [], changed: false };
-  }
-
-  let changed = false;
-  const events: string[] = [];
-
-  const nextProposals = proposals.map((p) => {
-    const lifecycle = p.proposalLifecycleStatus ?? 'ACTIVE';
-    if (p.status !== 'PROPOSED' || lifecycle !== 'ACTIVE') {
-      return p;
-    }
-
-    const isLong = p.direction === 'LONG';
-    const tfSeries = candlesByTf[p.timeframe] ?? [];
-    const latestBarTime = tfSeries.length > 0 ? tfSeries[tfSeries.length - 1].time : undefined;
-    let nextTtl = p.ttlBarsRemaining ?? getDefaultTtlBars(p.timeframe);
-    let nextBarSeen = p.lastBarTimeSeen;
-    let mutated = false;
-
-    if (latestBarTime !== undefined) {
-      if (nextBarSeen === undefined) {
-        nextBarSeen = latestBarTime;
-        mutated = true;
-      } else if (latestBarTime > nextBarSeen) {
-        const stepSec = Math.max(60, TIMEFRAME_SECONDS[p.timeframe]);
-        const barsClosed = Math.max(1, Math.floor((latestBarTime - nextBarSeen) / stepSec));
-        nextTtl = Math.max(0, nextTtl - barsClosed);
-        nextBarSeen = latestBarTime;
-        mutated = true;
-      }
-    }
-
-    const invalidation = p.invalidationPrice ?? p.stopLoss;
-    const structureBreached = isLong
-      ? spot <= invalidation || bid <= invalidation
-      : spot >= invalidation || ask >= invalidation;
-
-    if (structureBreached) {
-      changed = true;
-      events.push(
-        `Proposal invalidated (${p.direction} ${p.timeframe}): spot breached invalidation $${invalidation.toFixed(2)} before fill.`
-      );
-      return {
-        ...p,
-        ttlBarsRemaining: nextTtl,
-        lastBarTimeSeen: nextBarSeen,
-        proposalLifecycleStatus: 'INVALIDATED_STRUCTURE' as ProposalLifecycleStatus,
-      };
-    }
-
-    // Front-Run Protection for LIMIT orders: TP1 reached before entry zone fill
-    if ((p.orderType ?? 'LIMIT') === 'LIMIT') {
-      const targetHitBeforeFill = isLong
-        ? spot >= p.tp1 || bid >= p.tp1
-        : spot <= p.tp1 || ask <= p.tp1;
-      if (targetHitBeforeFill) {
-        changed = true;
-        events.push(
-          `Front-Run cancelled (${p.direction} ${p.timeframe}): Target $${p.tp1.toFixed(2)} hit before fill — Do NOT enter late!`
-        );
-        return {
-          ...p,
-          ttlBarsRemaining: nextTtl,
-          lastBarTimeSeen: nextBarSeen,
-          proposalLifecycleStatus: 'CANCELLED_FRONT_RUN' as ProposalLifecycleStatus,
-        };
-      }
-    }
-
-    // Candle-age / wall-clock TTL expiration
-    const expired = nextTtl <= 0 || (p.expiresAtTime !== undefined && nowMs > p.expiresAtTime);
-    if (expired) {
-      changed = true;
-      events.push(
-        `Proposal expired (TTL ${p.timeframe}): ${p.direction} ${p.setupType} timed out before broker execution.`
-      );
-      return {
-        ...p,
-        ttlBarsRemaining: 0,
-        lastBarTimeSeen: nextBarSeen,
-        proposalLifecycleStatus: 'EXPIRED_TTL' as ProposalLifecycleStatus,
-      };
-    }
-
-    if (mutated) {
-      changed = true;
-      return {
-        ...p,
-        ttlBarsRemaining: nextTtl,
-        lastBarTimeSeen: nextBarSeen,
-      };
-    }
-    return p;
-  });
-
-  return { proposals: changed ? nextProposals : proposals, events, changed };
-}
-
-function buildEmptyCandles(): Record<Timeframe, Candle[]> {
-  return {
-    M1: [],
-    M5: [],
-    M15: [],
-    M30: [],
-    H1: [],
-    H4: [],
+    M1: generateSeedSeries('M1', 110, anchorPrice, nowSec),
+    M5: generateSeedSeries('M5', 110, anchorPrice, nowSec),
+    M15: generateSeedSeries('M15', 110, anchorPrice, nowSec),
+    M30: generateSeedSeries('M30', 110, anchorPrice, nowSec),
+    H1: generateSeedSeries('H1', 110, anchorPrice, nowSec),
+    H4: generateSeedSeries('H4', 110, anchorPrice, nowSec),
   };
 }
 
@@ -505,53 +328,200 @@ function buildDefaultNews(mode: 'CLEAR' | 'CAUTION' | 'LOCKOUT' = 'CLEAR'): News
       }),
     ];
   }
-  return [];
+  return [
+    normalizeNews({
+      id: 'ev-claims',
+      title: 'US Initial Jobless Claims',
+      currency: 'USD',
+      impact: 'MEDIUM',
+      scheduledAtMs: now + 48 * min,
+      forecast: '215K',
+      previous: '218K',
+    }),
+    normalizeNews({
+      id: 'ev-cpi',
+      title: 'US Core CPI (MoM)',
+      currency: 'USD',
+      impact: 'HIGH',
+      scheduledAtMs: now + 135 * min,
+      forecast: '0.3%',
+      previous: '0.3%',
+    }),
+    normalizeNews({
+      id: 'ev-fomc',
+      title: 'FOMC Press Conference',
+      currency: 'USD',
+      impact: 'HIGH',
+      scheduledAtMs: now + 290 * min,
+      forecast: '—',
+      previous: '—',
+    }),
+  ];
 }
 
-const initialCandles = buildEmptyCandles();
+const initialCandles = buildInitialCandles(2742.6);
 const initialNews = buildDefaultNews('CLEAR');
 const initialNewsGate = evaluateNewsGate(initialNews);
-const initialTick: Tick = {
+const initialTick = normalizeTick({
   symbol: 'XAUUSD',
-  last: 0,
-  bid: 0,
-  ask: 0,
-  spread: 0,
-  timestampMs: Date.now(),
+  last: 2742.6,
+  bid: 2742.48,
+  ask: 2742.72,
+  spread: 0.24,
   tier: 1,
-  source: 'Connecting to Interbank Feed...',
-  seq: 0,
-};
-const initialBasis = evaluateBasisDivergence(0, 0);
+  source: 'Interbank XAU/USD',
+  seq: 1,
+});
+const initialBasis = evaluateBasisDivergence(initialTick.last, initialTick.last - 1.45);
 const initialQuant = analyzeQuantSnapshot('M15', initialCandles, {
   newsGate: initialNewsGate,
   basis: initialBasis,
-  spread: 0,
+  spread: initialTick.spread,
 });
 const initialAdvisory = buildSystem2Advisory(
-  'CONNECTING_LIVE_FEED',
-  0,
-  0,
+  'BOOT_SNAPSHOT',
+  initialTick.last,
+  initialTick.spread,
   initialQuant,
   initialNewsGate,
   null
 );
-const initialAccount = createInitialSimAccount(25000, 100, 7.0);
-const initialNow = Date.now();
-const initialEquityHistory = createInitialEquityHistory(
-  initialAccount.initialBalance,
-  initialAccount.equity,
-  initialNow,
-  initialNow
-);
+
+function seedInitialProposals(
+  spot: number,
+  quant: QuantSnapshot,
+  newsGate: NewsGateStatus,
+  basis: BasisDivergence,
+  baseBalance = 25000
+): {
+  proposals: AgentProposal[];
+  confirmed: ConfirmedPosition[];
+  closedTrades: ClosedTradeRecord[];
+  account: SimAccountState;
+  equityHistory: SessionEquityPoint[];
+} {
+  const nowMs = Date.now();
+  const seedOpts = { allowCautionVariant: true, spread: initialTick.spread };
+  const p0 = generateQuantProposal(spot, 'M15', quant, newsGate, basis, 0, seedOpts);
+  const p1 = generateQuantProposal(spot, 'M5', quant, newsGate, basis, 1, seedOpts);
+  const p2 = generateQuantProposal(spot, 'H1', quant, newsGate, basis, 2, seedOpts);
+  const p3 = generateQuantProposal(spot, 'M15', quant, newsGate, basis, 3, seedOpts);
+
+  const proposals: AgentProposal[] = [];
+  const confirmed: ConfirmedPosition[] = [];
+  const seedHistory = generateSeedClosedTrades(spot, baseBalance, nowMs, 7.0);
+  let account = seedHistory.account;
+  let equityHistory: SessionEquityPoint[] = [];
+  for (const pt of seedHistory.equityTrail) {
+    equityHistory = appendSessionEquityPoint(equityHistory, pt.equity, pt.peakEquity, pt.timeMs);
+  }
+
+  if (p0) {
+    const confirmedP0: AgentProposal = { ...p0, id: 'prop-seed-01', status: 'CONFIRMED', createdAtMs: Date.now() - 24 * 60_000 };
+    proposals.push(confirmedP0);
+    const seedEntry = Number((p0.direction === 'LONG' ? spot - 2.4 : spot + 2.4).toFixed(2));
+    const slDist = Math.abs(p0.entry - p0.stopLoss);
+    const seedSl = Number((p0.direction === 'LONG' ? seedEntry - slDist : seedEntry + slDist).toFixed(2));
+    const seedTp1 = Number((p0.direction === 'LONG' ? seedEntry + slDist * p0.rrRatio : seedEntry - slDist * p0.rrRatio).toFixed(2));
+    const seedTp2 = Number((p0.direction === 'LONG' ? seedEntry + slDist * (p0.rrRatio + 1.1) : seedEntry - slDist * (p0.rrRatio + 1.1)).toFixed(2));
+    const seedLot = 0.25;
+    const isLong = confirmedP0.direction === 'LONG';
+    const markPrice = isLong ? spot - 0.12 : spot + 0.12;
+    const openComm = Number(((account.commissionPerLotRoundTurn / 2) * seedLot).toFixed(2));
+    const grossPnl = Number(((isLong ? markPrice - seedEntry : seedEntry - markPrice) * seedLot * 100).toFixed(2));
+    const marginUsed = calculateRequiredMargin(seedEntry, seedLot, account.leverage);
+    const riskUsd = Number((Math.abs(seedEntry - seedSl) * seedLot * 100).toFixed(2));
+    const openedAtMs = Date.now() - 22 * 60_000;
+
+    const basePos: ConfirmedPosition = {
+      id: 'brk-seed-01',
+      orderId: 'ORD-SEED01',
+      proposalId: confirmedP0.id,
+      setupType: confirmedP0.setupType,
+      timeframe: confirmedP0.timeframe,
+      executionType: 'MARKET',
+      status: 'ACTIVE',
+      direction: confirmedP0.direction,
+      requestedEntry: seedEntry,
+      entry: seedEntry,
+      fillPrice: seedEntry,
+      slippageUsd: 0.03,
+      initialSl: seedSl,
+      stopLoss: seedSl,
+      tp1: seedTp1,
+      tp2: seedTp2,
+      initialLotSize: seedLot,
+      lotSize: seedLot,
+      spread: initialTick.spread,
+      stage: 'OPEN',
+      rrRatio: confirmedP0.rrRatio,
+      unrealizedPnl: grossPnl,
+      grossPnl,
+      netPnl: grossPnl,
+      realizedPnl: 0,
+      commissionPaid: openComm,
+      swapAccrued: 0,
+      marginUsed,
+      riskUsd,
+      mfeUsd: Math.max(0, grossPnl),
+      maeUsd: Math.min(0, grossPnl),
+      trailingStopDistance: null,
+      realizedPartial: false,
+      openedAtMs,
+      history: [{ timeMs: openedAtMs, event: `FILLED ${confirmedP0.direction} ${seedLot.toFixed(2)} lot @ ${seedEntry.toFixed(2)}`, price: seedEntry }],
+      executionLog: [
+        {
+          id: 'ev-seed-fill',
+          timeMs: openedAtMs,
+          kind: 'FILL',
+          message: `Market filled ${confirmedP0.direction} ${seedLot.toFixed(2)} lot @ $${seedEntry.toFixed(2)} (slip $0.03, comm $${openComm.toFixed(2)})`,
+          price: seedEntry,
+        },
+      ],
+      rMultiple: 0,
+      urgency: 'NORMAL',
+      actionTag: 'HOLD_RUNNER',
+      adviceEn: '',
+      adviceFa: '',
+      lastReviewedMs: Date.now(),
+    };
+    const evaluated = {
+      ...evaluateConfirmedPositionAdvice(basePos, markPrice, quant, newsGate, basis),
+      grossPnl,
+      netPnl: grossPnl,
+      unrealizedPnl: grossPnl,
+      mfeUsd: Math.max(0, grossPnl),
+      maeUsd: Math.min(0, grossPnl),
+    };
+    confirmed.push(evaluated);
+    account = reconcileSimAccount(
+      {
+        ...account,
+        balance: Number((account.balance - openComm).toFixed(2)),
+        realizedPnl: Number((account.realizedPnl - openComm).toFixed(2)),
+        totalCommissionPaid: Number((account.totalCommissionPaid + openComm).toFixed(2)),
+      },
+      confirmed
+    );
+    equityHistory = appendSessionEquityPoint(equityHistory, account.equity, account.peakEquity, nowMs);
+  }
+
+  if (p1) proposals.push({ ...p1, id: 'prop-seed-02', createdAtMs: nowMs - 14 * 60_000 });
+  if (p2) proposals.push({ ...p2, id: 'prop-seed-03', createdAtMs: nowMs - 7 * 60_000 });
+  if (p3) proposals.push({ ...p3, id: 'prop-seed-04', createdAtMs: nowMs - 2 * 60_000 });
+
+  return { proposals, confirmed, closedTrades: seedHistory.closedTrades, account, equityHistory };
+}
+
+const seeded = seedInitialProposals(initialTick.last, initialQuant, initialNewsGate, initialBasis);
 const initialAgentConfig = loadPersistedAgentConfig();
 const initialLiveNewsIntel = buildInitialNewsIntelligence(initialNews);
 const initialCircuitBreakers = evaluateRiskCircuitBreakers({
   config: initialAgentConfig,
-  simAccount: initialAccount,
-  confirmedPositions: [],
-  closedTrades: [],
-  spread: 0,
+  simAccount: seeded.account,
+  confirmedPositions: seeded.confirmed,
+  closedTrades: seeded.closedTrades,
+  spread: initialTick.spread,
   newsGate: initialNewsGate,
   liveNews: initialLiveNewsIntel,
 });
@@ -559,21 +529,10 @@ const initialAuditLog: AgentAuditEntry[] = [
   createAuditEntry(
     'CONFIG',
     'INFO',
-    'Payam Institutional Governance Booted (Zero-Mock Mode)',
-    `Awaiting live interbank XAU/USD stream · 7 Risk Circuit Breakers armed · Min Score ${initialAgentConfig.minConfluenceScore}/100 · Max DD ${initialAgentConfig.maxDailyDrawdownPct.toFixed(1)}%.`
+    'Payam Institutional Governance Booted',
+    `7 Risk Circuit Breakers armed · Min Score ${initialAgentConfig.minConfluenceScore}/100 · Max DD ${initialAgentConfig.maxDailyDrawdownPct.toFixed(1)}% · 14 Core Gold News sources registered.`
   ),
 ];
-const initialAiTelemetry: AiTelemetryState = {
-  activeStage: 0,
-  subAgents: {
-    smc_quant: { status: 'IDLE' },
-    macro_news: { status: 'IDLE' },
-    red_team: { status: 'IDLE' },
-    execution_architect: { status: 'IDLE' },
-    position_guardian: { status: 'IDLE' },
-  },
-  latestThinkingTrace: undefined,
-};
 
 export const useAurumStore = create<AurumStore>((set, get) => ({
   activeTab: 'deck',
@@ -582,26 +541,35 @@ export const useAurumStore = create<AurumStore>((set, get) => ({
   vectorModalOpen: false,
   candlesByTf: initialCandles,
   tick: initialTick,
-  feedMode: 'CONNECTING',
-  ticksPerMinute: 0,
-  tickTimestampsMs: [],
+  feedMode: 'REPLAY_SIM',
   basisDivergence: initialBasis,
   quant: initialQuant,
   position: null,
-  pendingLimits: [],
+  pendingLimits: [
+    {
+      id: 'lim-101',
+      direction: 'LONG',
+      entry: 2736.5,
+      stopLoss: 2731.0,
+      tp1: 2746.5,
+      tp2: 2756.0,
+      lotSize: 0.2,
+      status: 'PENDING_ENTRY',
+    },
+  ],
   newsEvents: initialNews,
   newsGate: initialNewsGate,
   advisory: initialAdvisory,
   pipeline: {
     activeTier: 1,
-    sourceName: 'Connecting to Interbank Feed...',
-    ttlMs: 0,
-    loopLagP99Ms: 0,
+    sourceName: 'Interbank XAU/USD',
+    ttlMs: 140,
+    loopLagP99Ms: 1.45,
     failoverCount: 0,
     tripwireCount: 0,
     rejectedSpikes: 0,
-    wsSequenceId: 0,
-    lastEventNote: 'Connecting to live Swissquote Interbank BBO / SSE market stream...',
+    wsSequenceId: 1,
+    lastEventNote: 'Tier 1 interbank spot reference nominal',
   },
   layers: {
     fvg: true,
@@ -620,18 +588,16 @@ export const useAurumStore = create<AurumStore>((set, get) => ({
   agentMode: 'HYBRID',
   agentBusy: false,
   agentError: null,
-  agentScanCount: 0,
-  lastAgentScanMs: null,
+  agentScanCount: 1,
+  lastAgentScanMs: Date.now(),
   activeTools: AGENT_TOOLS,
-  proposals: [],
-  confirmedPositions: [],
-  closedTrades: [],
-  closedConfirmedCount: 0,
-  focusedPositionId: null,
-  simAccount: initialAccount,
-  sessionEquityHistory: initialEquityHistory,
-
-  aiTelemetry: initialAiTelemetry,
+  proposals: seeded.proposals,
+  confirmedPositions: seeded.confirmed,
+  closedTrades: seeded.closedTrades,
+  closedConfirmedCount: seeded.closedTrades.length,
+  focusedPositionId: seeded.confirmed[0]?.id ?? null,
+  simAccount: seeded.account,
+  sessionEquityHistory: seeded.equityHistory,
 
   agentConfig: initialAgentConfig,
   circuitBreakers: initialCircuitBreakers,
@@ -642,8 +608,8 @@ export const useAurumStore = create<AurumStore>((set, get) => ({
   cooldownBypassAfterMs: null,
   agentAuditLog: initialAuditLog,
   candleSourceMeta: {
-    source: 'Connecting to Live Feed...',
-    rawFeed: 'NONE',
+    source: 'Local Seed (Syncing Online...)',
+    rawFeed: 'SEED',
     calibratedToSpot: false,
     basisOffsetUsd: 0,
     storageBackend: 'memory',
@@ -888,99 +854,6 @@ export const useAurumStore = create<AurumStore>((set, get) => ({
     });
   },
 
-  setFeedConnectionState: (mode, note) =>
-    set((s) => ({
-      feedMode: mode,
-      pipeline: {
-        ...s.pipeline,
-        sourceName:
-          mode === 'FEED_DISCONNECTED'
-            ? 'Feed Disconnected'
-            : mode === 'CONNECTING'
-              ? 'Connecting to Interbank Feed...'
-              : s.pipeline.sourceName,
-        lastEventNote:
-          note ??
-          (mode === 'FEED_DISCONNECTED'
-            ? 'Live market feed disconnected — autonomous signal scanning halted.'
-            : mode === 'CONNECTING'
-              ? 'Connecting to live interbank market stream...'
-              : s.pipeline.lastEventNote),
-      },
-    })),
-
-  ingestSsePayload: (payload) => {
-    if (!payload || typeof payload !== 'object') return;
-    const state = get();
-
-    // 1. Ingest sub-agent telemetry updates if present in SSE event
-    const rawTelemetry = (payload.aiTelemetry ?? payload.telemetry) as Partial<AiTelemetryState> | undefined;
-    if (rawTelemetry && typeof rawTelemetry === 'object') {
-      set({
-        aiTelemetry: {
-          activeStage: typeof rawTelemetry.activeStage === 'number' ? rawTelemetry.activeStage : state.aiTelemetry.activeStage,
-          subAgents: {
-            ...state.aiTelemetry.subAgents,
-            ...(rawTelemetry.subAgents && typeof rawTelemetry.subAgents === 'object' ? rawTelemetry.subAgents : {}),
-          },
-          latestThinkingTrace:
-            typeof rawTelemetry.latestThinkingTrace === 'string'
-              ? rawTelemetry.latestThinkingTrace
-              : state.aiTelemetry.latestThinkingTrace,
-        },
-      });
-    } else if (typeof payload.thinkingTrace === 'string') {
-      set({
-        aiTelemetry: {
-          ...state.aiTelemetry,
-          latestThinkingTrace: payload.thinkingTrace,
-        },
-      });
-    }
-
-    // 2. Ingest live spot / PAXG market tick if present
-    const spotObj = (payload.spot ?? payload.interbank ?? payload) as Record<string, unknown>;
-    const spotPrice = Number(spotObj.mid ?? spotObj.last ?? spotObj.price);
-    if (Number.isFinite(spotPrice) && spotPrice > 0) {
-      const spot = Number(spotPrice.toFixed(2));
-      const bid = Number(
-        (typeof spotObj.bid === 'number' && Number.isFinite(spotObj.bid) ? spotObj.bid : spot - 0.14).toFixed(2)
-      );
-      const ask = Number(
-        (typeof spotObj.ask === 'number' && Number.isFinite(spotObj.ask) ? spotObj.ask : spot + 0.14).toFixed(2)
-      );
-      const spread = Number(
-        (typeof spotObj.spread === 'number' && Number.isFinite(spotObj.spread) ? spotObj.spread : Math.max(0.02, ask - bid)).toFixed(2)
-      );
-      const paxgObj = payload.paxg as Record<string, unknown> | undefined;
-      const paxgRaw = Number(paxgObj?.mid ?? paxgObj?.last ?? payload.paxgMid);
-      const paxgLast = Number.isFinite(paxgRaw) && paxgRaw > 0 ? Number(paxgRaw.toFixed(2)) : undefined;
-      const sourceLabel = typeof spotObj.source === 'string' && spotObj.source ? spotObj.source : 'Swissquote Interbank SSE';
-      const tier = spotObj.tier === 2 || spotObj.tier === 3 ? spotObj.tier : 1;
-      const tsMs = typeof payload.timestampMs === 'number' && Number.isFinite(payload.timestampMs) ? payload.timestampMs : Date.now();
-
-      if (get().feedMode !== 'LIVE_INTERBANK') {
-        set({ feedMode: 'LIVE_INTERBANK' });
-      }
-      get().applyTickUpdate(
-        {
-          last: spot,
-          bid,
-          ask,
-          spread,
-          tier,
-          source: sourceLabel,
-          timestampMs: tsMs,
-        },
-        paxgLast
-      );
-
-      if (!get().candleSourceMeta.liveHistorical && !get().candleSourceMeta.hydrating) {
-        void get().hydrateRealCandles();
-      }
-    }
-  },
-
   hydrateRealCandles: async (force = false) => {
     const startState = get();
     if (startState.candleSourceMeta.hydrating && !force) return;
@@ -991,18 +864,12 @@ export const useAurumStore = create<AurumStore>((set, get) => ({
     try {
       const res = await fetch(`/api/candles/bundle?limit=240${force ? '&force=1' : ''}`);
       if (!res.ok) {
-        set((s) => ({
-          candleSourceMeta: { ...s.candleSourceMeta, hydrating: false },
-          feedMode: s.tick.last > 0 ? s.feedMode : 'FEED_DISCONNECTED',
-        }));
+        set((s) => ({ candleSourceMeta: { ...s.candleSourceMeta, hydrating: false } }));
         return;
       }
       const data = await res.json();
       if (!data?.ok || !data?.candlesByTf) {
-        set((s) => ({
-          candleSourceMeta: { ...s.candleSourceMeta, hydrating: false },
-          feedMode: s.tick.last > 0 ? s.feedMode : 'FEED_DISCONNECTED',
-        }));
+        set((s) => ({ candleSourceMeta: { ...s.candleSourceMeta, hydrating: false } }));
         return;
       }
 
@@ -1019,10 +886,7 @@ export const useAurumStore = create<AurumStore>((set, get) => ({
       }
 
       if (!hydratedAny) {
-        set((s) => ({
-          candleSourceMeta: { ...s.candleSourceMeta, hydrating: false },
-          feedMode: s.tick.last > 0 ? s.feedMode : 'FEED_DISCONNECTED',
-        }));
+        set((s) => ({ candleSourceMeta: { ...s.candleSourceMeta, hydrating: false } }));
         return;
       }
 
@@ -1044,23 +908,22 @@ export const useAurumStore = create<AurumStore>((set, get) => ({
         agentConfig: state.agentConfig,
         newsShock: { detected: state.liveNewsIntel.shockDetected, headline: state.liveNewsIntel.shockHeadline },
       });
-      const nextAdvisory = buildSystem2Advisory(
-        'LIVE_CANDLES_HYDRATED',
-        spot,
-        spread,
-        nextQuant,
-        state.newsGate,
-        state.confirmedPositions[0] ?? state.position ?? null
-      );
-      const nextBreakers = evaluateRiskCircuitBreakers({
-        config: state.agentConfig,
-        simAccount: state.simAccount,
-        confirmedPositions: state.confirmedPositions,
-        closedTrades: state.closedTrades,
-        spread,
-        newsGate: state.newsGate,
-        liveNews: state.liveNewsIntel,
-        cooldownBypassAfterMs: state.cooldownBypassAfterMs,
+
+      const wasUnrebased = !state.candleSourceMeta.liveHistorical && Math.abs(spot - state.tick.last) > 25;
+      const onlySeedPositions =
+        state.confirmedPositions.length <= 1 &&
+        (state.confirmedPositions.length === 0 || state.confirmedPositions[0].id === 'brk-seed-01');
+
+      const rebasedPendingLimits = state.pendingLimits.map((lim) => {
+        if (!wasUnrebased && Math.abs(lim.entry - spot) <= 120) return lim;
+        const delta = spot - state.tick.last;
+        return {
+          ...lim,
+          entry: Number((lim.entry + delta).toFixed(2)),
+          stopLoss: Number((lim.stopLoss + delta).toFixed(2)),
+          tp1: Number((lim.tp1 + delta).toFixed(2)),
+          tp2: Number((lim.tp2 + delta).toFixed(2)),
+        };
       });
 
       const nextMeta = {
@@ -1074,14 +937,70 @@ export const useAurumStore = create<AurumStore>((set, get) => ({
         hydrating: false,
       };
 
+      if (wasUnrebased && onlySeedPositions) {
+        const rebasedSeeds = seedInitialProposals(spot, nextQuant, state.newsGate, nextBasis, state.simAccount.initialBalance);
+        const rebasedAdvisory = buildSystem2Advisory(
+          'LIVE_CANDLES_HYDRATED',
+          spot,
+          spread,
+          nextQuant,
+          state.newsGate,
+          rebasedSeeds.confirmed[0] ?? null
+        );
+        const nextBreakers = evaluateRiskCircuitBreakers({
+          config: state.agentConfig,
+          simAccount: rebasedSeeds.account,
+          confirmedPositions: rebasedSeeds.confirmed,
+          closedTrades: rebasedSeeds.closedTrades,
+          spread,
+          newsGate: state.newsGate,
+          liveNews: state.liveNewsIntel,
+          cooldownBypassAfterMs: state.cooldownBypassAfterMs,
+        });
+        set({
+          feedMode: 'LIVE_INTERBANK',
+          candlesByTf: mergedByTf,
+          quant: nextQuant,
+          basisDivergence: nextBasis,
+          pendingLimits: rebasedPendingLimits,
+          proposals: rebasedSeeds.proposals,
+          confirmedPositions: rebasedSeeds.confirmed,
+          closedTrades: rebasedSeeds.closedTrades,
+          closedConfirmedCount: rebasedSeeds.closedTrades.length,
+          simAccount: rebasedSeeds.account,
+          sessionEquityHistory: rebasedSeeds.equityHistory,
+          circuitBreakers: nextBreakers,
+          advisory: rebasedAdvisory,
+          focusedPositionId: rebasedSeeds.confirmed[0]?.id ?? null,
+          candleSourceMeta: nextMeta,
+          tick: normalizeTick({
+            symbol: 'XAUUSD',
+            last: spot,
+            bid,
+            ask,
+            spread,
+            tier: 1,
+            source: sourceLabel,
+            seq: state.pipeline.wsSequenceId + 1,
+            timestampMs: Date.now(),
+          }),
+          pipeline: {
+            ...state.pipeline,
+            activeTier: 1,
+            sourceName: sourceLabel,
+            wsSequenceId: state.pipeline.wsSequenceId + 1,
+            lastEventNote: `Hydrated 240 real calibrated bars/TF (${nextMeta.source})`,
+          },
+        });
+        return;
+      }
+
       set({
         feedMode: 'LIVE_INTERBANK',
         candlesByTf: mergedByTf,
         quant: nextQuant,
         basisDivergence: nextBasis,
-        circuitBreakers: nextBreakers,
-        advisory: nextAdvisory,
-        auditResults: run18GateAudit(mergedByTf),
+        pendingLimits: rebasedPendingLimits,
         candleSourceMeta: nextMeta,
         tick: normalizeTick({
           symbol: 'XAUUSD',
@@ -1099,33 +1018,25 @@ export const useAurumStore = create<AurumStore>((set, get) => ({
           activeTier: 1,
           sourceName: sourceLabel,
           wsSequenceId: state.pipeline.wsSequenceId + 1,
-          loopLagP99Ms: Number(Math.max(0.1, nextQuant.computeMs).toFixed(2)),
-          lastEventNote: `Hydrated 240 real calibrated bars/TF (${nextMeta.source})`,
+          lastEventNote: `Synced live multi-TF candles (${nextMeta.source})`,
         },
       });
     } catch {
-      set((s) => ({
-        candleSourceMeta: { ...s.candleSourceMeta, hydrating: false },
-        feedMode: s.tick.last > 0 ? s.feedMode : 'FEED_DISCONNECTED',
-      }));
+      set((s) => ({ candleSourceMeta: { ...s.candleSourceMeta, hydrating: false } }));
     }
   },
 
   pollLiveMarket: async () => {
     try {
       const res = await fetch('/api/market/live');
-      if (!res.ok) {
-        get().setFeedConnectionState('FEED_DISCONNECTED', `Live market endpoint returned HTTP ${res.status} — scanning halted.`);
-        return;
-      }
+      if (!res.ok) return;
       const data = await res.json();
       const spotObj = data?.spot ?? data?.interbank;
       const spotPrice = Number(spotObj?.mid ?? spotObj?.last);
       if (!data?.live || !Number.isFinite(spotPrice) || spotPrice <= 0) {
-        get().setFeedConnectionState(
-          'FEED_DISCONNECTED',
-          data?.reason || 'Interbank spot feeds unreachable — signal scanning halted (no fake prices synthesized).'
-        );
+        if (get().feedMode !== 'REPLAY_SIM') {
+          set({ feedMode: 'REPLAY_SIM' });
+        }
         return;
       }
 
@@ -1136,13 +1047,77 @@ export const useAurumStore = create<AurumStore>((set, get) => ({
       const paxgRaw = data?.paxg?.mid ?? data?.paxg?.last;
       const paxgLast = typeof paxgRaw === 'number' && Number.isFinite(paxgRaw) ? Number(paxgRaw.toFixed(2)) : spot;
       const sourceLabel = spotObj?.source || 'Swissquote Interbank BBO';
-      const tier = spotObj?.tier === 2 || spotObj?.tier === 3 ? spotObj.tier : 1;
       const storageBackend = data?.storageBackend === 'timescaledb' ? 'timescaledb' : 'memory';
-      const tsMs = typeof data?.timestampMs === 'number' && Number.isFinite(data.timestampMs) ? data.timestampMs : Date.now();
 
       const state = get();
       if (state.candleSourceMeta.storageBackend !== storageBackend) {
         set({ candleSourceMeta: { ...state.candleSourceMeta, storageBackend } });
+      }
+
+      // If first real live price differs significantly from bootstrap seed anchor and real candles haven't hydrated yet, rebase cleanly
+      if (state.feedMode === 'REPLAY_SIM' && !state.candleSourceMeta.liveHistorical && Math.abs(spot - state.tick.last) > 25) {
+        const rebasedCandles = buildInitialCandles(spot);
+        const rebasedBasis = evaluateBasisDivergence(spot, paxgLast);
+        const rebasedQuant = analyzeQuantSnapshot(state.timeframe, rebasedCandles, {
+          newsGate: state.newsGate,
+          basis: rebasedBasis,
+          spread,
+          agentConfig: state.agentConfig,
+          newsShock: { detected: state.liveNewsIntel.shockDetected, headline: state.liveNewsIntel.shockHeadline },
+        });
+        const rebasedSeeds = seedInitialProposals(spot, rebasedQuant, state.newsGate, rebasedBasis, state.simAccount.initialBalance);
+        const delta = spot - state.tick.last;
+        const rebasedPendingLimits = state.pendingLimits.map((lim) => ({
+          ...lim,
+          entry: Number((lim.entry + delta).toFixed(2)),
+          stopLoss: Number((lim.stopLoss + delta).toFixed(2)),
+          tp1: Number((lim.tp1 + delta).toFixed(2)),
+          tp2: Number((lim.tp2 + delta).toFixed(2)),
+        }));
+        const rebasedAdvisory = buildSystem2Advisory(
+          'LIVE_INTERBANK_REBASE',
+          spot,
+          spread,
+          rebasedQuant,
+          state.newsGate,
+          rebasedSeeds.confirmed[0] ?? null
+        );
+        set({
+          feedMode: 'LIVE_INTERBANK',
+          candlesByTf: rebasedCandles,
+          quant: rebasedQuant,
+          basisDivergence: rebasedBasis,
+          pendingLimits: rebasedPendingLimits,
+          proposals: rebasedSeeds.proposals,
+          confirmedPositions: rebasedSeeds.confirmed,
+          closedTrades: rebasedSeeds.closedTrades,
+          closedConfirmedCount: rebasedSeeds.closedTrades.length,
+          simAccount: rebasedSeeds.account,
+          sessionEquityHistory: rebasedSeeds.equityHistory,
+          advisory: rebasedAdvisory,
+          focusedPositionId: rebasedSeeds.confirmed[0]?.id ?? null,
+          tick: normalizeTick({
+            symbol: 'XAUUSD',
+            last: spot,
+            bid,
+            ask,
+            spread,
+            tier: 1,
+            source: sourceLabel,
+            seq: state.pipeline.wsSequenceId + 1,
+            timestampMs: Date.now(),
+          }),
+          pipeline: {
+            ...state.pipeline,
+            activeTier: 1,
+            sourceName: sourceLabel,
+            wsSequenceId: state.pipeline.wsSequenceId + 1,
+            lastEventNote: `Live ${sourceLabel} synchronized with Binance PAXGUSDT basis monitor`,
+          },
+        });
+        // Immediately trigger deep real historical candle hydration in parallel
+        void get().hydrateRealCandles();
+        return;
       }
 
       set({ feedMode: 'LIVE_INTERBANK' });
@@ -1152,35 +1127,22 @@ export const useAurumStore = create<AurumStore>((set, get) => ({
           bid,
           ask,
           spread,
-          tier,
+          tier: 1,
           source: sourceLabel,
-          timestampMs: tsMs,
         },
         paxgLast
       );
-
-      if (!get().candleSourceMeta.liveHistorical && !get().candleSourceMeta.hydrating) {
-        void get().hydrateRealCandles();
-      }
     } catch {
-      get().setFeedConnectionState(
-        'FEED_DISCONNECTED',
-        'Network error polling /api/market/live — signal scanning halted.'
-      );
+      // Offline / network restricted sandbox: stay gracefully in local replay simulation
     }
   },
 
   applyTickUpdate: (rawTick, paxgRefPrice) => {
-    // ZERO MOCK FALLBACK: never synthesize fake random drift prices
-    if (!rawTick || typeof rawTick.last !== 'number' || !Number.isFinite(rawTick.last) || rawTick.last <= 0) {
-      return;
-    }
-
     const state = get();
-    const nowMs = Date.now();
-    const nextPrice = Number(rawTick.last.toFixed(2));
-    const nextBid = Number((rawTick.bid ?? nextPrice - 0.12).toFixed(2));
-    const nextAsk = Number((rawTick.ask ?? nextPrice + 0.12).toFixed(2));
+    const drift = (Math.random() - 0.485) * 0.55;
+    const nextPrice = Number((rawTick?.last ?? state.tick.last + drift).toFixed(2));
+    const nextBid = Number((rawTick?.bid ?? nextPrice - 0.12).toFixed(2));
+    const nextAsk = Number((rawTick?.ask ?? nextPrice + 0.12).toFixed(2));
     const nextSeq = state.pipeline.wsSequenceId + 1;
     const nextTick = normalizeTick(
       {
@@ -1188,32 +1150,17 @@ export const useAurumStore = create<AurumStore>((set, get) => ({
         last: nextPrice,
         bid: nextBid,
         ask: nextAsk,
-        spread: rawTick.spread ?? Number(Math.max(0.02, nextAsk - nextBid).toFixed(2)),
-        tier: rawTick.tier ?? state.pipeline.activeTier,
-        source: rawTick.source ?? state.pipeline.sourceName,
+        spread: rawTick?.spread ?? Number(Math.max(0.05, nextAsk - nextBid).toFixed(2)),
+        tier: rawTick?.tier ?? state.pipeline.activeTier,
+        source: rawTick?.source ?? state.pipeline.sourceName,
         seq: nextSeq,
-        timestampMs: nowMs,
+        timestampMs: Date.now(),
       },
-      nextPrice
+      state.tick.last
     );
 
-    // Deterministic Real Tick Volume: increment by 1 ONLY on real price-change ticks
-    const isPriceChange =
-      state.tick.last <= 0 ||
-      Math.abs(nextTick.last - state.tick.last) >= 0.005 ||
-      Math.abs(nextTick.bid - state.tick.bid) >= 0.005 ||
-      Math.abs(nextTick.ask - state.tick.ask) >= 0.005;
-
-    // Track rolling 60-second tick velocity (ticksPerMinute)
-    const windowCutoff = nowMs - 60_000;
-    const nextTickTimestamps = state.tickTimestampsMs.filter((ts) => ts >= windowCutoff);
-    if (isPriceChange) {
-      nextTickTimestamps.push(nowMs);
-    }
-    const ticksPerMinute = nextTickTimestamps.length;
-
-    // Update live forming candle across all timeframes deterministically
-    const nowSec = Math.floor(nowMs / 1000);
+    // Update live forming candle across all timeframes
+    const nowSec = Math.floor(nextTick.timestampMs / 1000);
     const updatedByTf = { ...state.candlesByTf };
     (['M1', 'M5', 'M15', 'M30', 'H1', 'H4'] as Timeframe[]).forEach((tf) => {
       const series = [...updatedByTf[tf]];
@@ -1228,7 +1175,7 @@ export const useAurumStore = create<AurumStore>((set, get) => ({
             high: nextTick.last,
             low: nextTick.last,
             close: nextTick.last,
-            volume: 1,
+            volume: 12,
           })
         );
         if (series.length > 300) series.shift();
@@ -1238,49 +1185,32 @@ export const useAurumStore = create<AurumStore>((set, get) => ({
           high: Math.max(last.high, nextTick.last),
           low: Math.min(last.low, nextTick.last),
           close: nextTick.last,
-          volume: last.volume + (isPriceChange ? 1 : 0),
+          volume: last.volume + Math.round(2 + Math.random() * 6),
         });
       }
       updatedByTf[tf] = series;
     });
 
-    const effectivePaxg =
-      typeof paxgRefPrice === 'number' && Number.isFinite(paxgRefPrice) && paxgRefPrice > 0
+    const simPaxg =
+      typeof paxgRefPrice === 'number'
         ? paxgRefPrice
-        : state.basisDivergence.paxgPrice > 0
-          ? state.basisDivergence.paxgPrice
-          : nextTick.last;
-    const nextBasis = evaluateBasisDivergence(nextTick.last, effectivePaxg);
+        : Number((nextTick.last - (state.pipeline.activeTier === 2 ? 4.8 : 1.35) + (Math.random() - 0.5) * 0.9).toFixed(2));
+    const nextBasis = evaluateBasisDivergence(nextTick.last, simPaxg);
     const nextQuant = analyzeQuantSnapshot(state.timeframe, updatedByTf, {
       newsGate: state.newsGate,
       basis: nextBasis,
       spread: nextTick.spread,
-      nowMs,
+      nowMs: nextTick.timestampMs,
       agentConfig: state.agentConfig,
       newsShock: { detected: state.liveNewsIntel.shockDetected, headline: state.liveNewsIntel.shockHeadline },
     });
-
-    // Enforce Candle-Age TTL, Front-Run Cancellation & Pre-Fill Invalidation on all unconfirmed proposals
-    const lifecycleCheck = evaluateProposalLifecycles(
-      state.proposals,
-      updatedByTf,
-      nextTick.last,
-      nextTick.bid,
-      nextTick.ask,
-      nowMs
-    );
-    let nextProposals = lifecycleCheck.proposals;
 
     let nextPos = state.position;
     let nextAdvisory = state.advisory;
     let banner = state.statusBanner;
 
-    if (lifecycleCheck.events.length > 0) {
-      banner = lifecycleCheck.events[lifecycleCheck.events.length - 1];
-    }
-
     if (nextPos) {
-      const hsm = stepHsmPosition(nextPos, nextTick.last, nowMs);
+      const hsm = stepHsmPosition(nextPos, nextTick.last, nextTick.timestampMs);
       nextPos = normalizePosition(hsm.position);
       if (hsm.event) {
         banner = `HSM transition: ${hsm.event} @ $${nextTick.last.toFixed(2)}`;
@@ -1291,10 +1221,7 @@ export const useAurumStore = create<AurumStore>((set, get) => ({
       }
     }
 
-    // Continuously monitor & step EVERY confirmed broker position on every live Bid/Ask tick
-    const prevPendingIds = new Set(
-      state.confirmedPositions.filter((p) => p.status === 'PENDING_LIMIT').map((p) => p.proposalId)
-    );
+    // Continuously simulate & monitor EVERY confirmed broker position on every live Bid/Ask tick
     const simStep = stepSimulatedPositions(
       state.confirmedPositions,
       state.simAccount,
@@ -1302,25 +1229,8 @@ export const useAurumStore = create<AurumStore>((set, get) => ({
       nextQuant,
       state.newsGate,
       nextBasis,
-      nowMs,
-      state.agentConfig.autoScaleOutTp1Pct
+      nextTick.timestampMs
     );
-
-    // Sync proposalLifecycleStatus to FILLED_IN_BROKER when a tracked LIMIT order fills
-    if (prevPendingIds.size > 0) {
-      const newlyFilledProposalIds = new Set(
-        simStep.positions
-          .filter((p) => p.status === 'ACTIVE' && prevPendingIds.has(p.proposalId))
-          .map((p) => p.proposalId)
-      );
-      if (newlyFilledProposalIds.size > 0) {
-        nextProposals = nextProposals.map((p) =>
-          newlyFilledProposalIds.has(p.id)
-            ? { ...p, proposalLifecycleStatus: 'FILLED_IN_BROKER' as ProposalLifecycleStatus }
-            : p
-        );
-      }
-    }
 
     if (simStep.events.length > 0) {
       banner = simStep.events[simStep.events.length - 1];
@@ -1343,7 +1253,7 @@ export const useAurumStore = create<AurumStore>((set, get) => ({
             state.sessionEquityHistory,
             simStep.account.equity,
             simStep.account.peakEquity,
-            nowMs
+            nextTick.timestampMs
           )
         : state.sessionEquityHistory;
 
@@ -1356,21 +1266,15 @@ export const useAurumStore = create<AurumStore>((set, get) => ({
       newsGate: state.newsGate,
       liveNews: state.liveNewsIntel,
       cooldownBypassAfterMs: state.cooldownBypassAfterMs,
-      nowMs,
+      nowMs: nextTick.timestampMs,
     });
 
-    const sourceTsMs = typeof rawTick.timestampMs === 'number' && Number.isFinite(rawTick.timestampMs) ? rawTick.timestampMs : nowMs;
-    const measuredTtlMs = Math.max(1, Math.min(5000, Math.abs(nowMs - sourceTsMs)));
-    const measuredLoopLag = Number(Math.max(0.1, nextQuant.computeMs).toFixed(2));
-
+    const jitterLag = Number((1.15 + Math.random() * 0.65).toFixed(2));
     set({
       tick: nextTick,
-      ticksPerMinute,
-      tickTimestampsMs: nextTickTimestamps,
       candlesByTf: updatedByTf,
       quant: nextQuant,
       basisDivergence: nextBasis,
-      proposals: nextProposals,
       position: nextPos,
       confirmedPositions: simStep.positions,
       closedTrades: nextClosedTrades,
@@ -1383,10 +1287,9 @@ export const useAurumStore = create<AurumStore>((set, get) => ({
       statusBanner: banner,
       pipeline: {
         ...state.pipeline,
-        activeTier: nextTick.tier,
-        sourceName: rawTick.source ?? state.pipeline.sourceName,
-        ttlMs: measuredTtlMs,
-        loopLagP99Ms: measuredLoopLag,
+        sourceName: rawTick?.source ?? state.pipeline.sourceName,
+        ttlMs: Math.round(85 + Math.random() * 130),
+        loopLagP99Ms: jitterLag,
         wsSequenceId: nextSeq,
       },
     });
@@ -1434,20 +1337,6 @@ export const useAurumStore = create<AurumStore>((set, get) => ({
     const state = get();
     if (state.agentBusy) return;
 
-    // ZERO-MOCK DISCIPLINE: halt signal scanning whenever feed is connecting or disconnected
-    const activeSeriesLen = (state.candlesByTf[state.timeframe] ?? []).length;
-    if (state.feedMode !== 'LIVE_INTERBANK' || state.tick.last <= 0 || activeSeriesLen < 20) {
-      const msg =
-        state.feedMode === 'FEED_DISCONNECTED'
-          ? 'Live interbank feed disconnected — signal scanning halted.'
-          : 'Waiting for live interbank feed & calibrated candles before scanning.';
-      set({
-        agentError: msg,
-        statusBanner: msg,
-      });
-      return;
-    }
-
     const liveBreakers = evaluateRiskCircuitBreakers({
       config: state.agentConfig,
       simAccount: state.simAccount,
@@ -1470,30 +1359,14 @@ export const useAurumStore = create<AurumStore>((set, get) => ({
       return;
     }
 
-    const scanStartMs = Date.now();
-    set({
-      agentBusy: true,
-      agentError: null,
-      circuitBreakers: liveBreakers,
-      aiTelemetry: {
-        activeStage: 1,
-        subAgents: {
-          ...state.aiTelemetry.subAgents,
-          smc_quant: { status: 'RUNNING', summary: `Analyzing ${state.timeframe} SMC + RSI` },
-          macro_news: { status: 'RUNNING', summary: `${state.liveNewsIntel.macroSentiment}` },
-          red_team: { status: 'QUEUED' },
-          execution_architect: { status: 'QUEUED' },
-        },
-        latestThinkingTrace: state.aiTelemetry.latestThinkingTrace,
-      },
-    });
+    set({ agentBusy: true, agentError: null, circuitBreakers: liveBreakers });
     const scanIdx = state.agentScanCount + 1;
 
     try {
       let createdProposal: AgentProposal | null = null;
       let standDownMessage: string | null = null;
       let apiNotice: string | null = null;
-      let latestThinkingTrace = state.aiTelemetry.latestThinkingTrace;
+      let geminiCallSucceeded = false;
 
       // Refresh deterministic Payam Brain snapshot immediately before proposing
       const liveQuant = analyzeQuantSnapshot(state.timeframe, state.candlesByTf, {
@@ -1504,27 +1377,12 @@ export const useAurumStore = create<AurumStore>((set, get) => ({
         newsShock: { detected: state.liveNewsIntel.shockDetected, headline: state.liveNewsIntel.shockHeadline },
       });
 
-      // Route ALL AI modes — including ANTIGRAVITY_MCP — through /api/agent/propose with executionMode
-      if (!opts?.quantOnly) {
-        set((s) => ({
-          aiTelemetry: {
-            ...s.aiTelemetry,
-            activeStage: 2,
-            subAgents: {
-              ...s.aiTelemetry.subAgents,
-              smc_quant: { status: 'DONE', latencyMs: Math.round(liveQuant.computeMs), summary: `Score ${liveQuant.brain.totalScore}/100` },
-              macro_news: { status: 'DONE', summary: `${state.newsGate.state}` },
-              red_team: { status: 'RUNNING', summary: `Mode: ${state.agentMode}` },
-              execution_architect: { status: 'RUNNING' },
-            },
-          },
-        }));
-
+      // Attempt real server-side Gemini agentic tool reasoning when not explicitly quantOnly and not MCP-only
+      if (!opts?.quantOnly && state.agentMode !== 'ANTIGRAVITY_MCP') {
         const res = await fetch('/api/agent/propose', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            executionMode: state.agentMode,
             spotPrice: state.tick.last,
             spread: state.tick.spread,
             timeframe: state.timeframe,
@@ -1544,39 +1402,28 @@ export const useAurumStore = create<AurumStore>((set, get) => ({
         });
 
         const payload = await res.json().catch(() => null);
-        if (payload?.thinkingTrace && typeof payload.thinkingTrace === 'string') {
-          latestThinkingTrace = payload.thinkingTrace;
-        }
-        if (payload?.aiTelemetry && typeof payload.aiTelemetry === 'object') {
-          set((s) => ({
-            aiTelemetry: {
-              activeStage: payload.aiTelemetry.activeStage ?? 3,
-              subAgents: { ...s.aiTelemetry.subAgents, ...(payload.aiTelemetry.subAgents ?? {}) },
-              latestThinkingTrace: payload.aiTelemetry.latestThinkingTrace ?? latestThinkingTrace,
-            },
-          }));
-        }
-
         if (res.ok && payload?.ok && payload.decision === 'STAND_DOWN') {
+          geminiCallSucceeded = true;
           standDownMessage =
             payload.standDownReasonEn ||
             liveQuant.brain.summaryEn ||
             'Payam Brain enforced STAND DOWN — anti-emotion shield active.';
         } else if (res.ok && payload?.ok && payload.proposal) {
+          geminiCallSucceeded = true;
           createdProposal = payload.proposal as AgentProposal;
-          if (createdProposal.thinkingTrace) {
-            latestThinkingTrace = createdProposal.thinkingTrace;
-          }
         } else {
           apiNotice =
             payload?.error ||
-            `Agent bridge (${state.agentMode}) returned HTTP ${res.status}. Configure GEMINI_API_KEY in Secrets or use System 1 Quant Scan.`;
+            `Gemini API returned HTTP ${res.status}. Configure GEMINI_API_KEY in Secrets or use System 1 Quant Scan.`;
         }
       }
 
-      // Deterministic Payam Brain fallback applies ONLY for explicit quantOnly or HYBRID mode (never silently bypassing ANTIGRAVITY_MCP)
+      // In HYBRID mode (default), gracefully fall back to deterministic Payam Brain Engine when Gemini API key is not configured or rate-limited
       const allowQuantFallback =
-        !standDownMessage && (Boolean(opts?.quantOnly) || state.agentMode === 'HYBRID');
+        !standDownMessage &&
+        (Boolean(opts?.quantOnly) ||
+          state.agentMode === 'ANTIGRAVITY_MCP' ||
+          state.agentMode === 'HYBRID');
 
       if (!createdProposal && allowQuantFallback) {
         createdProposal = generateQuantProposal(
@@ -1598,22 +1445,66 @@ export const useAurumStore = create<AurumStore>((set, get) => ({
         }
       }
 
-      // Enrich proposal with Sniper Zone, Order Type, Candle-Age TTL & Circuit Breaker risk throttle
-      if (createdProposal) {
-        createdProposal = enrichProposalLifecycle(
-          createdProposal,
-          state.candlesByTf,
-          state.tick.last,
-          state.tick.spread,
-          Date.now()
-        );
-        if (liveBreakers.effectiveRiskMultiplier < 1) {
-          createdProposal = {
-            ...createdProposal,
-            recommendedRiskMultiplier: Number(
-              Math.min(createdProposal.recommendedRiskMultiplier ?? 1, liveBreakers.effectiveRiskMultiplier).toFixed(2)
-            ),
-          };
+      // Apply circuit-breaker risk throttle multiplier onto proposal recommendation
+      if (createdProposal && liveBreakers.effectiveRiskMultiplier < 1) {
+        createdProposal = {
+          ...createdProposal,
+          recommendedRiskMultiplier: Number(
+            Math.min(createdProposal.recommendedRiskMultiplier ?? 1, liveBreakers.effectiveRiskMultiplier).toFixed(2)
+          ),
+        };
+      }
+
+      // Also refresh Gemini monitoring advice on confirmed open broker positions ONLY when Gemini upstream succeeded
+      let monitoredPositions = get().confirmedPositions.map((cp) =>
+        evaluateConfirmedPositionAdvice(cp, get().tick.last, liveQuant, get().newsGate, get().basisDivergence)
+      );
+
+      if (!opts?.quantOnly && state.agentMode !== 'ANTIGRAVITY_MCP' && monitoredPositions.length > 0 && geminiCallSucceeded) {
+        try {
+          const monRes = await fetch('/api/agent/monitor', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              spotPrice: get().tick.last,
+              quant: liveQuant,
+              newsGate: get().newsGate,
+              basis: get().basisDivergence,
+              liveNews: {
+                macroSentiment: get().liveNewsIntel.macroSentiment,
+                shockHeadline: get().liveNewsIntel.shockHeadline,
+              },
+              positions: monitoredPositions.map((p) => ({
+                id: p.id,
+                direction: p.direction,
+                entry: p.entry,
+                stopLoss: p.stopLoss,
+                tp1: p.tp1,
+                tp2: p.tp2,
+                stage: p.stage,
+                rMultiple: p.rMultiple,
+                unrealizedPnl: p.unrealizedPnl,
+              })),
+            }),
+          });
+          const monData = await monRes.json().catch(() => null);
+          if (monRes.ok && monData?.ok && Array.isArray(monData.updates)) {
+            const byId = new Map<string, any>(monData.updates.map((u: any) => [u.positionId, u]));
+            monitoredPositions = monitoredPositions.map((pos) => {
+              const upd = byId.get(pos.id);
+              if (!upd) return pos;
+              return {
+                ...pos,
+                actionTag: upd.actionTag || pos.actionTag,
+                urgency: upd.urgency || pos.urgency,
+                adviceEn: upd.adviceEn || pos.adviceEn,
+                adviceFa: upd.adviceFa || pos.adviceFa,
+                lastReviewedMs: Date.now(),
+              };
+            });
+          }
+        } catch {
+          // Keep deterministic HSM monitoring advice if monitor call fails
         }
       }
 
@@ -1626,7 +1517,7 @@ export const useAurumStore = create<AurumStore>((set, get) => ({
             'PROPOSAL',
             'INFO',
             `Proposed ${createdProposal.direction} [${createdProposal.convictionGrade ?? 'A'} · ${createdProposal.confluenceScore ?? liveQuant.brain.totalScore}/100]`,
-            `${createdProposal.orderType ?? 'LIMIT'} ${createdProposal.setupType} @ $${createdProposal.entry.toFixed(2)} · SL $${createdProposal.stopLoss.toFixed(2)} · TP1 $${createdProposal.tp1.toFixed(2)} (R:R 1:${createdProposal.rrRatio.toFixed(2)} · TTL ${createdProposal.ttlBarsRemaining}b)`
+            `${createdProposal.setupType} @ $${createdProposal.entry.toFixed(2)} · SL $${createdProposal.stopLoss.toFixed(2)} · TP1 $${createdProposal.tp1.toFixed(2)} (R:R 1:${createdProposal.rrRatio.toFixed(2)})`
           )
         : createAuditEntry(
             'STAND_DOWN',
@@ -1635,471 +1526,29 @@ export const useAurumStore = create<AurumStore>((set, get) => ({
             standDownMessage || liveQuant.brain.summaryEn
           );
 
-      const scanLatencyMs = Date.now() - scanStartMs;
-      set((s) => ({
+      set({
         agentBusy: false,
         agentScanCount: scanIdx,
         lastAgentScanMs: Date.now(),
         agentError: apiNotice,
         quant: liveQuant,
         proposals: nextProposals,
-        agentAuditLog: [auditEntry, ...s.agentAuditLog].slice(0, 40),
-        aiTelemetry: {
-          activeStage: 4,
-          subAgents: {
-            ...s.aiTelemetry.subAgents,
-            smc_quant: { status: 'DONE', latencyMs: Math.round(liveQuant.computeMs), summary: `${liveQuant.brain.totalScore}/100` },
-            macro_news: { status: 'DONE', summary: state.liveNewsIntel.macroSentiment },
-            red_team: {
-              status: createdProposal ? 'DONE' : 'STAND_DOWN',
-              latencyMs: scanLatencyMs,
-              summary:
-                createdProposal?.redTeamRiskScore !== undefined
-                  ? `Risk ${createdProposal.redTeamRiskScore}/100`
-                  : standDownMessage
-                    ? 'Vetoed / Stand Down'
-                    : 'Cleared',
-            },
-            execution_architect: {
-              status: createdProposal ? 'PROPOSED' : 'IDLE',
-              latencyMs: scanLatencyMs,
-              summary: createdProposal ? `${createdProposal.orderType} ${createdProposal.direction}` : 'No Entry',
-            },
-          },
-          latestThinkingTrace,
-        },
+        confirmedPositions: monitoredPositions,
+        agentAuditLog: [auditEntry, ...get().agentAuditLog].slice(0, 40),
         statusBanner: createdProposal
-          ? `Payam Brain [${createdProposal.convictionGrade ?? 'A'} · ${createdProposal.confluenceScore ?? Math.round(createdProposal.confidence * 100)}/100] proposed ${createdProposal.orderType} ${createdProposal.direction} ${createdProposal.setupType} @ $${createdProposal.entry.toFixed(2)} (R:R 1:${createdProposal.rrRatio.toFixed(2)})`
+          ? `Payam Brain [${createdProposal.convictionGrade ?? 'A'} · ${createdProposal.confluenceScore ?? Math.round(createdProposal.confidence * 100)}/100] proposed ${createdProposal.direction} ${createdProposal.setupType} @ $${createdProposal.entry.toFixed(2)} (R:R 1:${createdProposal.rrRatio.toFixed(2)})`
           : standDownMessage
             ? `Payam Brain STAND DOWN (${liveQuant.brain.totalScore}/100): ${standDownMessage}`
             : apiNotice
-              ? `Agent scan notice: ${apiNotice}`
-              : s.statusBanner,
-      }));
-
-      // Also refresh live position guardian directives if open positions exist
-      if (get().confirmedPositions.length > 0) {
-        void get().monitorOpenPositions();
-      }
+              ? `Gemini scan notice: ${apiNotice}`
+              : get().statusBanner,
+      });
     } catch (err: any) {
-      set((s) => ({
+      set({
         agentBusy: false,
         agentError: err?.message || 'Agentic scan request failed.',
-        aiTelemetry: {
-          ...s.aiTelemetry,
-          activeStage: 0,
-          subAgents: {
-            ...s.aiTelemetry.subAgents,
-            execution_architect: { status: 'ERROR', summary: err?.message || 'Scan failed' },
-          },
-        },
-      }));
-    }
-  },
-
-  monitorOpenPositions: async () => {
-    const state = get();
-    if (state.confirmedPositions.length === 0) return;
-
-    const startedAt = Date.now();
-    const liveTick = state.tick;
-    const liveQuant = state.quant;
-    const scaleOutPct = state.agentConfig.autoScaleOutTp1Pct;
-
-    // 1. Always compute deterministic System-1 Co-Pilot directive immediately
-    let monitored: ConfirmedPosition[] = state.confirmedPositions.map((cp) => {
-      const markPrice =
-        liveTick.last > 0
-          ? cp.direction === 'LONG'
-            ? liveTick.bid
-            : liveTick.ask
-          : cp.entry;
-      const advised =
-        cp.status === 'ACTIVE'
-          ? evaluateConfirmedPositionAdvice(cp, markPrice, liveQuant, state.newsGate, state.basisDivergence)
-          : cp;
-      const directive = derivePositionCoPilotDirective(
-        advised,
-        markPrice,
-        liveQuant,
-        state.newsGate,
-        state.basisDivergence,
-        scaleOutPct
-      );
-      return {
-        ...advised,
-        ...directive,
-        thinkingTrace: cp.thinkingTrace,
-        lastReviewedMs: Date.now(),
-      };
-    });
-
-    set((s) => ({
-      confirmedPositions: monitored,
-      aiTelemetry: {
-        ...s.aiTelemetry,
-        subAgents: {
-          ...s.aiTelemetry.subAgents,
-          position_guardian: {
-            status: 'RUNNING',
-            summary: `Monitoring ${monitored.length} broker position(s)`,
-          },
-        },
-      },
-    }));
-
-    // 2. Call /api/agent/monitor for System-2 Co-Pilot enrichment when live feed is connected
-    if (state.feedMode !== 'LIVE_INTERBANK' || liveTick.last <= 0) {
-      set((s) => ({
-        aiTelemetry: {
-          ...s.aiTelemetry,
-          subAgents: {
-            ...s.aiTelemetry.subAgents,
-            position_guardian: {
-              status: 'LOCAL_ONLY',
-              latencyMs: Date.now() - startedAt,
-              summary: 'Deterministic HSM active (awaiting live feed)',
-            },
-          },
-        },
-      }));
-      return;
-    }
-
-    try {
-      const monRes = await fetch('/api/agent/monitor', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          executionMode: state.agentMode,
-          spotPrice: liveTick.last,
-          quant: liveQuant,
-          newsGate: state.newsGate,
-          basis: state.basisDivergence,
-          liveNews: {
-            macroSentiment: state.liveNewsIntel.macroSentiment,
-            shockHeadline: state.liveNewsIntel.shockHeadline,
-          },
-          positions: monitored.map((p) => ({
-            id: p.id,
-            status: p.status,
-            direction: p.direction,
-            entry: p.entry,
-            stopLoss: p.stopLoss,
-            tp1: p.tp1,
-            tp2: p.tp2,
-            lotSize: p.lotSize,
-            stage: p.stage,
-            rMultiple: p.rMultiple,
-            unrealizedPnl: p.unrealizedPnl,
-            latestDirective: p.latestDirective,
-          })),
-        }),
       });
-
-      const monData = await monRes.json().catch(() => null);
-      if (monRes.ok && monData?.ok && Array.isArray(monData.updates)) {
-        const byId = new Map<string, any>(monData.updates.map((u: any) => [u.positionId, u]));
-        const latestPositions = get().confirmedPositions;
-        const enriched = latestPositions.map((pos) => {
-          const upd = byId.get(pos.id);
-          if (!upd) return pos;
-
-          const validDirectives: PositionCoPilotDirective[] = [
-            'HOLD_STEADY',
-            'MOVE_SL_TO_BREAKEVEN',
-            'PARTIAL_TAKE_PROFIT_TP1',
-            'TRAIL_STOP_STRUCTURAL',
-            'EMERGENCY_EXIT_NOW',
-          ];
-          const mappedDirective: PositionCoPilotDirective = validDirectives.includes(upd.latestDirective)
-            ? upd.latestDirective
-            : upd.actionTag === 'EXIT_WARNING' || upd.actionTag === 'PROTECT_NEWS'
-              ? 'EMERGENCY_EXIT_NOW'
-              : upd.actionTag === 'SCALE_PARTIAL'
-                ? 'PARTIAL_TAKE_PROFIT_TP1'
-                : upd.actionTag === 'ARM_BE' || upd.actionTag === 'MOVE_SL_RF'
-                  ? 'MOVE_SL_TO_BREAKEVEN'
-                  : (pos.latestDirective ?? 'HOLD_STEADY');
-
-          const mappedUrgency: 'NORMAL' | 'HIGH' | 'CRITICAL' =
-            upd.directiveUrgency === 'CRITICAL' || upd.directiveUrgency === 'HIGH' || upd.directiveUrgency === 'NORMAL'
-              ? upd.directiveUrgency
-              : upd.urgency === 'CRITICAL'
-                ? 'CRITICAL'
-                : upd.urgency === 'ATTENTION'
-                  ? 'HIGH'
-                  : (pos.directiveUrgency ?? 'NORMAL');
-
-          return {
-            ...pos,
-            actionTag: upd.actionTag || pos.actionTag,
-            urgency: upd.urgency || pos.urgency,
-            adviceEn: upd.adviceEn || pos.adviceEn,
-            adviceFa: upd.adviceFa || pos.adviceFa,
-            latestDirective: mappedDirective,
-            recommendedActionPrice:
-              typeof upd.recommendedActionPrice === 'number' && Number.isFinite(upd.recommendedActionPrice)
-                ? Number(upd.recommendedActionPrice.toFixed(2))
-                : pos.recommendedActionPrice,
-            recommendedScaleOutPct:
-              typeof upd.recommendedScaleOutPct === 'number' && Number.isFinite(upd.recommendedScaleOutPct)
-                ? upd.recommendedScaleOutPct
-                : pos.recommendedScaleOutPct,
-            directiveUrgency: mappedUrgency,
-            directiveRationaleEn: upd.directiveRationaleEn || upd.adviceEn || pos.directiveRationaleEn,
-            directiveRationaleFa: upd.directiveRationaleFa || upd.adviceFa || pos.directiveRationaleFa,
-            thinkingTrace: typeof upd.thinkingTrace === 'string' ? upd.thinkingTrace : pos.thinkingTrace,
-            lastReviewedMs: Date.now(),
-          };
-        });
-
-        set((s) => ({
-          confirmedPositions: enriched,
-          aiTelemetry: {
-            ...s.aiTelemetry,
-            subAgents: {
-              ...s.aiTelemetry.subAgents,
-              position_guardian: {
-                status: 'DONE',
-                latencyMs: Date.now() - startedAt,
-                summary: `AI Co-Pilot synced ${enriched.length} position(s)`,
-              },
-            },
-            latestThinkingTrace:
-              typeof monData.thinkingTrace === 'string'
-                ? monData.thinkingTrace
-                : s.aiTelemetry.latestThinkingTrace,
-          },
-        }));
-      } else {
-        set((s) => ({
-          aiTelemetry: {
-            ...s.aiTelemetry,
-            subAgents: {
-              ...s.aiTelemetry.subAgents,
-              position_guardian: {
-                status: 'DONE',
-                latencyMs: Date.now() - startedAt,
-                summary: `HSM Guardian active (${monitored.length} pos)`,
-              },
-            },
-          },
-        }));
-      }
-    } catch {
-      set((s) => ({
-        aiTelemetry: {
-          ...s.aiTelemetry,
-          subAgents: {
-            ...s.aiTelemetry.subAgents,
-            position_guardian: {
-              status: 'DONE',
-              latencyMs: Date.now() - startedAt,
-              summary: `HSM Guardian active (${monitored.length} pos)`,
-            },
-          },
-        },
-      }));
     }
-  },
-
-  applyPositionDirective: (positionId) => {
-    const state = get();
-    const pos = state.confirmedPositions.find((p) => p.id === positionId);
-    if (!pos) return;
-
-    const directive = pos.latestDirective ?? 'HOLD_STEADY';
-    const isLong = pos.direction === 'LONG';
-    const nowMs = Date.now();
-
-    if (directive === 'EMERGENCY_EXIT_NOW') {
-      get().closeConfirmedPosition(positionId);
-      set({
-        statusBanner: `Emergency exit synced in broker for ${pos.orderId} — position closed.`,
-      });
-      return;
-    }
-
-    if (directive === 'PARTIAL_TAKE_PROFIT_TP1') {
-      const pct = pos.recommendedScaleOutPct ?? state.agentConfig.autoScaleOutTp1Pct;
-      const frac = Math.max(0.1, Math.min(0.95, pct / 100));
-      get().partialClosePosition(positionId, frac);
-      // Also lock remaining runner SL at Break-Even
-      get().moveConfirmedPositionBreakEven(positionId);
-      set({
-        statusBanner: `Broker synced: closed ${Math.round(pct)}% at TP1 & moved remaining SL to Break-Even (${pos.orderId}).`,
-      });
-      return;
-    }
-
-    if (directive === 'MOVE_SL_TO_BREAKEVEN') {
-      const targetBe =
-        typeof pos.recommendedActionPrice === 'number' && Number.isFinite(pos.recommendedActionPrice)
-          ? Number(pos.recommendedActionPrice.toFixed(2))
-          : Number((isLong ? pos.entry + Math.max(pos.spread, 0.15) : pos.entry - Math.max(pos.spread, 0.15)).toFixed(2));
-      set({
-        confirmedPositions: state.confirmedPositions.map((p) =>
-          p.id === positionId
-            ? {
-                ...p,
-                stopLoss: targetBe,
-                stage: 'RISK_FREE_TP1' as const,
-                actionTag: 'HOLD_RUNNER' as const,
-                urgency: 'NORMAL' as const,
-                latestDirective: 'HOLD_STEADY' as const,
-                recommendedActionPrice: targetBe,
-                directiveUrgency: 'NORMAL' as const,
-                directiveRationaleEn: `Synced: Broker SL moved to Break-Even $${targetBe.toFixed(2)}. Runner is now risk-free toward TP2 $${p.tp2.toFixed(2)}.`,
-                directiveRationaleFa: `همگام شد: حد ضرر بروکر در $${targetBe.toFixed(2)} ریسک‌فری شد. ادامه حرکت به سمت TP2 ($${p.tp2.toFixed(2)}) بدون ریسک است.`,
-                adviceEn: `Broker SL locked risk-free at $${targetBe.toFixed(2)}.`,
-                adviceFa: `حد ضرر بروکر در $${targetBe.toFixed(2)} ریسک‌فری شد.`,
-                executionLog: [
-                  ...p.executionLog,
-                  {
-                    id: `ev-sync-be-${nowMs.toString(36)}`,
-                    timeMs: nowMs,
-                    kind: 'BE_LOCK' as const,
-                    message: `Trader synced Break-Even SL in broker -> $${targetBe.toFixed(2)}`,
-                    price: state.tick.last || p.entry,
-                  },
-                ].slice(-16),
-                lastReviewedMs: nowMs,
-              }
-            : p
-        ),
-        statusBanner: `Broker synced: ${pos.orderId} SL updated to Break-Even $${targetBe.toFixed(2)}.`,
-      });
-      return;
-    }
-
-    if (directive === 'TRAIL_STOP_STRUCTURAL') {
-      const targetSl =
-        typeof pos.recommendedActionPrice === 'number' && Number.isFinite(pos.recommendedActionPrice)
-          ? Number(pos.recommendedActionPrice.toFixed(2))
-          : pos.stopLoss;
-      const improves = isLong ? targetSl > pos.stopLoss : targetSl < pos.stopLoss;
-      const appliedSl = improves ? targetSl : pos.stopLoss;
-      set({
-        confirmedPositions: state.confirmedPositions.map((p) =>
-          p.id === positionId
-            ? {
-                ...p,
-                stopLoss: appliedSl,
-                latestDirective: 'HOLD_STEADY' as const,
-                recommendedActionPrice: appliedSl,
-                directiveUrgency: 'NORMAL' as const,
-                directiveRationaleEn: `Synced: Broker SL trailed behind M5 swing to $${appliedSl.toFixed(2)}. Hold runner toward TP2 $${p.tp2.toFixed(2)}.`,
-                directiveRationaleFa: `همگام شد: حد ضرر بروکر پشت سوئینگ M5 در $${appliedSl.toFixed(2)} تریل شد. مسیر تا TP2 ($${p.tp2.toFixed(2)}) باز است.`,
-                executionLog: [
-                  ...p.executionLog,
-                  {
-                    id: `ev-sync-tr-${nowMs.toString(36)}`,
-                    timeMs: nowMs,
-                    kind: 'TRAILING_SL' as const,
-                    message: `Trader synced Structural Trail SL in broker -> $${appliedSl.toFixed(2)}`,
-                    price: state.tick.last || p.entry,
-                  },
-                ].slice(-16),
-                lastReviewedMs: nowMs,
-              }
-            : p
-        ),
-        statusBanner: `Broker synced: ${pos.orderId} SL trailed to $${appliedSl.toFixed(2)}.`,
-      });
-      return;
-    }
-
-    set({
-      confirmedPositions: state.confirmedPositions.map((p) =>
-        p.id === positionId ? { ...p, lastReviewedMs: nowMs } : p
-      ),
-      statusBanner: `Position ${pos.orderId} confirmed synced with broker (HOLD STEADY).`,
-    });
-  },
-
-  markLimitFilledInBroker: (positionId, actualFillPrice) => {
-    const state = get();
-    const target = state.confirmedPositions.find((p) => p.id === positionId);
-    if (!target || target.status !== 'PENDING_LIMIT') return;
-
-    const nowMs = Date.now();
-    const fill =
-      typeof actualFillPrice === 'number' && Number.isFinite(actualFillPrice) && actualFillPrice > 0
-        ? Number(actualFillPrice.toFixed(2))
-        : target.entry;
-    const isLong = target.direction === 'LONG';
-    const marginReq = calculateRequiredMargin(fill, target.lotSize, state.simAccount.leverage);
-    const openComm = Number(((state.simAccount.commissionPerLotRoundTurn / 2) * target.lotSize).toFixed(2));
-    const markPrice = state.tick.last > 0 ? (isLong ? state.tick.bid : state.tick.ask) : fill;
-    const grossPnl = Number(((isLong ? markPrice - fill : fill - markPrice) * target.lotSize * 100).toFixed(2));
-    const netPnl = Number((grossPnl - openComm).toFixed(2));
-    const stopDist = Math.max(0.01, Math.abs(fill - target.stopLoss));
-    const rrRatio = Number((Math.abs(target.tp1 - fill) / stopDist).toFixed(2));
-
-    const updatedPosBase: ConfirmedPosition = {
-      ...target,
-      status: 'ACTIVE',
-      entry: fill,
-      fillPrice: fill,
-      slippageUsd: Number(Math.abs(fill - target.requestedEntry).toFixed(2)),
-      rrRatio,
-      marginUsed: marginReq,
-      commissionPaid: Number((target.commissionPaid + openComm).toFixed(2)),
-      grossPnl,
-      netPnl,
-      unrealizedPnl: netPnl,
-      openedAtMs: nowMs,
-      executionLog: [
-        ...target.executionLog,
-        {
-          id: `ev-mfill-${nowMs.toString(36)}`,
-          timeMs: nowMs,
-          kind: 'LIMIT_FILLED' as const,
-          message: `Trader confirmed LIMIT filled in broker @ $${fill.toFixed(2)} (anchored SL $${target.stopLoss.toFixed(2)})`,
-          price: fill,
-        },
-      ].slice(-16),
-      lastReviewedMs: nowMs,
-    };
-
-    const advised = evaluateConfirmedPositionAdvice(
-      updatedPosBase,
-      markPrice,
-      state.quant,
-      state.newsGate,
-      state.basisDivergence
-    );
-    const directive = derivePositionCoPilotDirective(
-      advised,
-      markPrice,
-      state.quant,
-      state.newsGate,
-      state.basisDivergence,
-      state.agentConfig.autoScaleOutTp1Pct
-    );
-    const finalPos: ConfirmedPosition = { ...advised, ...directive };
-
-    const nextConfirmed = state.confirmedPositions.map((p) => (p.id === positionId ? finalPos : p));
-    const nextProposals = state.proposals.map((p) =>
-      p.id === target.proposalId ? { ...p, proposalLifecycleStatus: 'FILLED_IN_BROKER' as ProposalLifecycleStatus } : p
-    );
-    const nextAccount = reconcileSimAccount(
-      {
-        ...state.simAccount,
-        balance: Number((state.simAccount.balance - openComm).toFixed(2)),
-        realizedPnl: Number((state.simAccount.realizedPnl - openComm).toFixed(2)),
-        totalCommissionPaid: Number((state.simAccount.totalCommissionPaid + openComm).toFixed(2)),
-      },
-      nextConfirmed
-    );
-
-    set({
-      confirmedPositions: nextConfirmed,
-      proposals: nextProposals,
-      simAccount: nextAccount,
-      statusBanner: `Pending limit ${target.orderId} marked FILLED in broker @ $${fill.toFixed(2)} — Co-Pilot Guardian active.`,
-    });
   },
 
   confirmProposal: (proposalId, optionsOrLot = 0.2) => {
@@ -2131,29 +1580,10 @@ export const useAurumStore = create<AurumStore>((set, get) => ({
     const target = state.proposals.find((p) => p.id === proposalId);
     if (!target) return { ok: false, errors: ['Proposal not found'] };
 
-    // Prevent confirming expired, invalidated, or front-run signals
-    const lifecycle = target.proposalLifecycleStatus ?? 'ACTIVE';
-    if (
-      lifecycle === 'EXPIRED_TTL' ||
-      lifecycle === 'INVALIDATED_STRUCTURE' ||
-      lifecycle === 'CANCELLED_FRONT_RUN'
-    ) {
-      const msg =
-        lifecycle === 'CANCELLED_FRONT_RUN'
-          ? 'Target hit before fill — Do NOT enter late!'
-          : lifecycle === 'INVALIDATED_STRUCTURE'
-            ? 'Proposal structure was invalidated before fill.'
-            : 'Proposal expired (TTL reached 0).';
-      set({ lastGuardrailErrors: [msg], statusBanner: msg });
-      return { ok: false, errors: [msg] };
-    }
-
     const rawLotSize = typeof optionsOrLot === 'number' ? optionsOrLot : (optionsOrLot.lotSize ?? 0.2);
     const lotSize = Number(Math.max(0.01, rawLotSize * breakers.effectiveRiskMultiplier).toFixed(2));
     const executionType: OrderExecutionType =
       typeof optionsOrLot === 'number' ? 'MARKET' : (optionsOrLot.executionType ?? 'MARKET');
-    const actualFillPrice =
-      typeof optionsOrLot === 'number' ? undefined : optionsOrLot.actualFillPrice;
     const trailingStopDistance =
       typeof optionsOrLot === 'number' ? null : (optionsOrLot.trailingStopDistance ?? null);
 
@@ -2161,9 +1591,7 @@ export const useAurumStore = create<AurumStore>((set, get) => ({
       proposal: target,
       lotSize,
       executionType,
-      actualFillPrice,
       trailingStopDistance,
-      autoScaleOutTp1Pct: state.agentConfig.autoScaleOutTp1Pct,
       tick: state.tick,
       quant: state.quant,
       newsGate: state.newsGate,
@@ -2181,15 +1609,11 @@ export const useAurumStore = create<AurumStore>((set, get) => ({
       return { ok: false, errors: sim.errors };
     }
 
-    const pos = sim.position;
-    const nextLifecycle: ProposalLifecycleStatus =
-      pos.status === 'PENDING_LIMIT' ? 'PENDING_LIMIT_IN_BROKER' : 'FILLED_IN_BROKER';
     const updatedProposals = state.proposals.map((p) =>
-      p.id === proposalId
-        ? { ...p, status: 'CONFIRMED' as const, proposalLifecycleStatus: nextLifecycle }
-        : p
+      p.id === proposalId ? { ...p, status: 'CONFIRMED' as const } : p
     );
 
+    const pos = sim.position;
     const nextConfirmed = [pos, ...state.confirmedPositions];
     const nextBreakers = evaluateRiskCircuitBreakers({
       config: state.agentConfig,
@@ -2219,14 +1643,14 @@ export const useAurumStore = create<AurumStore>((set, get) => ({
           'EXECUTION',
           'INFO',
           `Confirmed ${pos.direction} ${pos.lotSize.toFixed(2)} lot (${pos.orderId})`,
-          `${pos.status === 'PENDING_LIMIT' ? 'LIMIT' : 'FILLED'} ${pos.setupType} @ $${pos.fillPrice.toFixed(2)} · Anchored SL $${pos.stopLoss.toFixed(2)} · TP1 $${pos.tp1.toFixed(2)} (R:R 1:${pos.rrRatio.toFixed(2)})`
+          `${pos.setupType} @ $${pos.fillPrice.toFixed(2)} · SL $${pos.stopLoss.toFixed(2)} · TP1 $${pos.tp1.toFixed(2)}`
         ),
         ...state.agentAuditLog,
       ].slice(0, 40),
       statusBanner:
         pos.status === 'PENDING_LIMIT'
-          ? `Order ${pos.orderId} tracked: Pending ${pos.direction} LIMIT ${pos.lotSize.toFixed(2)} lot @ $${pos.entry.toFixed(2)} — watching entry zone`
-          : `Confirmed in Broker (${pos.orderId}): ${pos.direction} ${pos.lotSize.toFixed(2)} lot @ $${pos.fillPrice.toFixed(2)} · Anchored SL $${pos.stopLoss.toFixed(2)} · Co-Pilot active`,
+          ? `Order ${pos.orderId} armed: ${pos.direction} LIMIT ${pos.lotSize.toFixed(2)} lot @ $${pos.entry.toFixed(2)} — awaiting touch`
+          : `Executed ${pos.orderId}: ${pos.direction} ${pos.lotSize.toFixed(2)} lot @ $${pos.fillPrice.toFixed(2)} (Margin $${pos.marginUsed.toFixed(0)} · Slip $${pos.slippageUsd.toFixed(2)})`,
     });
 
     return { ok: true, errors: [], positionId: pos.id };

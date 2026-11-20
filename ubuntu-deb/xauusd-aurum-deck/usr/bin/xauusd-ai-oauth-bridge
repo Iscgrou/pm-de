@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# xauusd-ai-oauth-bridge — Ubuntu 24.04 LTS Helper for Antigravity (`agy`),
+# Gemini CLI (`gemini`), and `CLIProxyAPI` Local Subscription OAuth Proxy.
+#
+# Allows Payam XAUUSD Aurum Command Deck to route System-2 reasoning through
+# an active Gemini Pro/Ultra subscription on localhost (127.0.0.1:8080/v1)
+# without API key billing.
+# =============================================================================
+
+PROXY_HOST="${XAUUSD_OAUTH_HOST:-127.0.0.1}"
+PROXY_PORT="${XAUUSD_OAUTH_PORT:-8080}"
+PROXY_URL="http://${PROXY_HOST}:${PROXY_PORT}/v1"
+PID_FILE="/tmp/xauusd-ai-oauth-proxy.pid"
+LOG_FILE="/tmp/xauusd-ai-oauth-proxy.log"
+
+detect_cli() {
+  if command -v agy >/dev/null 2>&1; then
+    echo "agy"
+  elif command -v gemini >/dev/null 2>&1; then
+    echo "gemini"
+  elif command -v cliproxyapi >/dev/null 2>&1; then
+    echo "cliproxyapi"
+  else
+    echo "none"
+  fi
+}
+
+cmd_status() {
+  local cli
+  cli="$(detect_cli)"
+  echo "=== Payam XAUUSD Local OAuth Bridge Status ==="
+  echo "Detected CLI      : ${cli}"
+  echo "Target Proxy URL  : ${PROXY_URL}"
+  if curl -sf "${PROXY_URL}/models" >/dev/null 2>&1; then
+    echo "Proxy Status      : ONLINE (OpenAI-compatible loopback responding)"
+  else
+    echo "Proxy Status      : OFFLINE (run 'xauusd-ai-oauth-bridge start-proxy')"
+  fi
+  if [ -f "${PID_FILE}" ] && kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
+    echo "Background PID    : $(cat "${PID_FILE}")"
+  fi
+}
+
+cmd_login() {
+  local cli
+  cli="$(detect_cli)"
+  case "${cli}" in
+    agy)
+      echo "[oauth-bridge] Launching Antigravity CLI (agy) OAuth login..."
+      agy auth login || agy login
+      ;;
+    gemini)
+      echo "[oauth-bridge] Launching Gemini CLI OAuth login..."
+      gemini auth login || gemini --login
+      ;;
+    cliproxyapi)
+      echo "[oauth-bridge] Launching CLIProxyAPI Gemini OAuth login..."
+      cliproxyapi --gemini-login
+      ;;
+    *)
+      echo "[oauth-bridge] Neither 'agy', 'gemini', nor 'cliproxyapi' found in PATH."
+      echo "Install one of:"
+      echo "  • Gemini CLI   : npm install -g @google/gemini-cli"
+      echo "  • CLIProxyAPI  : https://github.com/router-for-me/CLIProxyAPI"
+      echo "  • Antigravity  : Install Antigravity Desktop / CLI (agy)"
+      exit 1
+      ;;
+  esac
+}
+
+cmd_start_proxy() {
+  if curl -sf "${PROXY_URL}/models" >/dev/null 2>&1; then
+    echo "[oauth-bridge] OAuth Proxy already running at ${PROXY_URL}"
+    exit 0
+  fi
+
+  if command -v cliproxyapi >/dev/null 2>&1; then
+    echo "[oauth-bridge] Starting CLIProxyAPI on ${PROXY_HOST}:${PROXY_PORT}..."
+    nohup cliproxyapi --host "${PROXY_HOST}" --port "${PROXY_PORT}" >> "${LOG_FILE}" 2>&1 &
+    echo $! > "${PID_FILE}"
+  elif command -v agy >/dev/null 2>&1; then
+    echo "[oauth-bridge] Starting Antigravity CLI (agy) OpenAI-compatible bridge on ${PROXY_HOST}:${PROXY_PORT}..."
+    nohup agy serve --host "${PROXY_HOST}" --port "${PROXY_PORT}" >> "${LOG_FILE}" 2>&1 &
+    echo $! > "${PID_FILE}"
+  else
+    echo "[oauth-bridge] Cannot start local proxy: install 'cliproxyapi' or 'agy' first."
+    echo "After installation, run: xauusd-ai-oauth-bridge login && xauusd-ai-oauth-bridge start-proxy"
+    exit 1
+  fi
+
+  sleep 1.5
+  if curl -sf "${PROXY_URL}/models" >/dev/null 2>&1; then
+    echo "[oauth-bridge] Ready: ${PROXY_URL} (logs: ${LOG_FILE})"
+  else
+    echo "[oauth-bridge] Started (PID $(cat "${PID_FILE}")), waiting for handshake. Check ${LOG_FILE}."
+  fi
+}
+
+cmd_stop_proxy() {
+  if [ -f "${PID_FILE}" ]; then
+    local pid
+    pid="$(cat "${PID_FILE}")"
+    if kill -0 "${pid}" 2>/dev/null; then
+      kill "${pid}" || true
+      echo "[oauth-bridge] Stopped OAuth proxy PID ${pid}."
+    fi
+    rm -f "${PID_FILE}"
+  else
+    echo "[oauth-bridge] No managed OAuth proxy PID file found."
+  fi
+}
+
+cmd_test() {
+  echo "[oauth-bridge] Probing ${PROXY_URL}/models ..."
+  curl -sf "${PROXY_URL}/models" | jq . || {
+    echo "[oauth-bridge] Proxy unreachable at ${PROXY_URL}."
+    exit 1
+  }
+}
+
+cmd_mcp_config() {
+  cat <<EOF
+{
+  "mcpServers": {
+    "payam-xauusd-aurum-deck": {
+      "command": "xauusd-aurum-deck",
+      "args": ["mcp"],
+      "url": "http://127.0.0.1:3000/mcp",
+      "env": {
+        "XAUUSD_DECK_URL": "http://127.0.0.1:3000",
+        "XAUUSD_OAUTH_PROXY": "${PROXY_URL}"
+      }
+    }
+  }
+}
+EOF
+}
+
+case "${1:-status}" in
+  status) cmd_status ;;
+  login) cmd_login ;;
+  start-proxy) cmd_start_proxy ;;
+  stop-proxy) cmd_stop_proxy ;;
+  test) cmd_test ;;
+  mcp-config) cmd_mcp_config ;;
+  *)
+    echo "Usage: xauusd-ai-oauth-bridge {status|login|start-proxy|stop-proxy|test|mcp-config}"
+    exit 1
+    ;;
+esac

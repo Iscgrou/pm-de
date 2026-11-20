@@ -2,11 +2,11 @@
 set -euo pipefail
 
 if [ -d /run/systemd/system ]; then
-  if systemctl is-active --quiet xauusd-sentinel.service; then
-    systemctl stop xauusd-sentinel.service || true
+  if systemctl is-active --quiet xauusd-aurum-deck.service; then
+    systemctl stop xauusd-aurum-deck.service || true
   fi
-  if systemctl is-enabled --quiet xauusd-sentinel.service; then
-    systemctl disable xauusd-sentinel.service || true
+  if systemctl is-enabled --quiet xauusd-aurum-deck.service; then
+    systemctl disable xauusd-aurum-deck.service || true
   fi
 fi
 

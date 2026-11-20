@@ -1,44 +1,53 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-URL="http://127.0.0.1:8787"
-APP_DIR="/opt/xauusd-agy-advisor"
+PORT="${PORT:-3000}"
+URL="http://127.0.0.1:${PORT}"
+APP_DIR="/opt/xauusd-aurum-deck"
+MCP_SCRIPT="/opt/xauusd-agy-advisor/mcp_server/xau_native_smc_mcp.py"
+LOG_FILE="${APP_DIR}/logs/aurum-deck.log"
 
 case "${1:-open}" in
   open)
     if ! curl -sf "${URL}/api/v1/health" >/dev/null 2>&1; then
-      if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files | grep -q xauusd-sentinel.service; then
-        sudo systemctl start xauusd-sentinel.service || true
+      if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files | grep -q xauusd-aurum-deck.service; then
+        sudo systemctl start xauusd-aurum-deck.service || true
         sleep 1.5
-      else
-        nohup "${APP_DIR}/.venv/bin/uvicorn" sentinel_app.server:app --host 127.0.0.1 --port 8787 \
-          >> "${APP_DIR}/cache/sentinel_server.log" 2>&1 &
-        sleep 1.5
+      elif [ -f "${APP_DIR}/server.ts" ]; then
+        mkdir -p "${APP_DIR}/logs"
+        nohup env NODE_ENV=production PORT="${PORT}" DISABLE_HMR=true npx --prefix "${APP_DIR}" tsx "${APP_DIR}/server.ts" \
+          >> "${LOG_FILE}" 2>&1 &
+        sleep 2.0
       fi
     fi
     if command -v xdg-open >/dev/null 2>&1; then
       xdg-open "${URL}" >/dev/null 2>&1 &
     else
-      echo "Aurum Command Deck running at ${URL}"
+      echo "Payam XAUUSD Aurum Command Deck running at ${URL}"
     fi
     ;;
-  verify)
-    cd "${APP_DIR}" && "${APP_DIR}/.venv/bin/python3" self_verify_10gates.py
+  status)
+    systemctl status xauusd-aurum-deck.service --no-pager || true
     ;;
-  test)
-    cd "${APP_DIR}" && "${APP_DIR}/.venv/bin/pytest" -v
+  restart)
+    sudo systemctl restart xauusd-aurum-deck.service
     ;;
   health)
     curl -s "${URL}/api/v1/health" | jq .
     ;;
   logs)
-    tail -f "${APP_DIR}/cache/sentinel_server.log"
+    tail -f "${LOG_FILE}"
+    ;;
+  oauth)
+    shift || true
+    exec /usr/bin/xauusd-ai-oauth-bridge "${@:-status}"
     ;;
   mcp)
-    cd "${APP_DIR}" && exec "${APP_DIR}/.venv/bin/python3" mcp_server/xau_native_smc_mcp.py
+    export XAUUSD_DECK_URL="${URL}"
+    exec python3 "${MCP_SCRIPT}"
     ;;
   *)
-    echo "Usage: xauusd-aurum-deck {open|verify|test|health|logs|mcp}"
+    echo "Usage: xauusd-aurum-deck {open|status|restart|health|logs|oauth [login|start-proxy|status|test]|mcp}"
     exit 1
     ;;
 esac

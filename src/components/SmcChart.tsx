@@ -9,11 +9,12 @@ import {
   RotateCcw,
   Ruler,
   SlidersHorizontal,
+  Sparkles,
   ZoomIn,
   ZoomOut,
 } from 'lucide-react';
 import { useAurumStore } from '../store/useStore';
-import type { ConfirmedPosition, Position, Timeframe } from '../engine/types';
+import type { Candle, ConfirmedPosition, Position, Timeframe } from '../engine/types';
 import { computeEmaSeries, computeWilderRsiSeries } from '../engine/payamBrain';
 import {
   DEFAULT_CHART_SETTINGS,
@@ -33,8 +34,62 @@ import {
   type ChartSettings,
 } from '../engine/chartEngine';
 import { ChartSettingsPopover } from './ChartSettingsPopover';
+import { AgentNeuralHud } from './AgentNeuralHud';
 
 const TIMEFRAMES: Timeframe[] = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4'];
+
+interface SessionLiquidityLevels {
+  asianHigh: number | null;
+  asianLow: number | null;
+  londonHigh: number | null;
+  londonLow: number | null;
+  nyHigh: number | null;
+  nyLow: number | null;
+}
+
+function computeSessionLiquidityLevels(candles: Candle[]): SessionLiquidityLevels {
+  const res: SessionLiquidityLevels = {
+    asianHigh: null,
+    asianLow: null,
+    londonHigh: null,
+    londonLow: null,
+    nyHigh: null,
+    nyLow: null,
+  };
+  if (candles.length < 4) return res;
+  const latestDay = Math.floor(candles[candles.length - 1].time / 86400);
+  // Look over current UTC day (or prior day if early Asian session has no London/NY bars yet)
+  const updateRange = (
+    hiKey: 'asianHigh' | 'londonHigh' | 'nyHigh',
+    loKey: 'asianLow' | 'londonLow' | 'nyLow',
+    c: Candle
+  ) => {
+    res[hiKey] = res[hiKey] === null ? c.high : Math.max(res[hiKey]!, c.high);
+    res[loKey] = res[loKey] === null ? c.low : Math.min(res[loKey]!, c.low);
+  };
+
+  for (const c of candles) {
+    const day = Math.floor(c.time / 86400);
+    if (day < latestDay - 1) continue;
+    const hr = new Date(c.time * 1000).getUTCHours();
+    if (day === latestDay) {
+      if (hr >= 0 && hr < 5) updateRange('asianHigh', 'asianLow', c);
+      else if (hr >= 7 && hr < 12) updateRange('londonHigh', 'londonLow', c);
+      else if (hr >= 12 && hr < 17) updateRange('nyHigh', 'nyLow', c);
+    }
+  }
+  // If today hasn't reached London or NY yet, seed from previous session for liquidity draw targets
+  if (res.londonHigh === null || res.nyHigh === null) {
+    for (const c of candles) {
+      const day = Math.floor(c.time / 86400);
+      if (day !== latestDay - 1) continue;
+      const hr = new Date(c.time * 1000).getUTCHours();
+      if (res.londonHigh === null && hr >= 7 && hr < 12) updateRange('londonHigh', 'londonLow', c);
+      if (res.nyHigh === null && hr >= 12 && hr < 17) updateRange('nyHigh', 'nyLow', c);
+    }
+  }
+  return res;
+}
 
 interface ChartGeometryRef {
   width: number;
@@ -72,6 +127,9 @@ export function SmcChart() {
   const candleSourceMeta = useAurumStore((s) => s.candleSourceMeta);
   const layers = useAurumStore((s) => s.layers);
   const streaming = useAurumStore((s) => s.streaming);
+  const agentEnabled = useAurumStore((s) => s.agentEnabled);
+  const agentBusy = useAurumStore((s) => s.agentBusy);
+  const proposals = useAurumStore((s) => s.proposals);
   const setTimeframe = useAurumStore((s) => s.setTimeframe);
   const toggleLayer = useAurumStore((s) => s.toggleLayer);
   const toggleStreaming = useAurumStore((s) => s.toggleStreaming);
@@ -91,6 +149,7 @@ export function SmcChart() {
 
   const [settings, setSettings] = useState<ChartSettings>(() => loadChartSettings());
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [hudEnabled, setHudEnabled] = useState(true);
   const [fullscreen, setFullscreen] = useState(false);
   const [rulerMode, setRulerMode] = useState(false);
   const [rulerStart, setRulerStart] = useState<RulerAnchor | null>(null);
@@ -175,12 +234,13 @@ export function SmcChart() {
     const ema50 = settings.showEma50 ? computeEmaSeries(closes, 50) : [];
     const vwap = settings.showVwap ? computeSessionVwap(rawCandles) : [];
     const prevDay = settings.showPdhPdl ? computePreviousDayLevels(rawCandles) : null;
+    const sessionLevels = computeSessionLiquidityLevels(rawCandles);
     const rsiFull =
       settings.rsiPeriod === 14 && quant.rsi.activeSeries.length === rawCandles.length
         ? quant.rsi.activeSeries
         : computeWilderRsiSeries(rawCandles, settings.rsiPeriod);
 
-    return { displayCandles, ema20, ema50, vwap, prevDay, rsiFull };
+    return { displayCandles, ema20, ema50, vwap, prevDay, sessionLevels, rsiFull };
   }, [
     rawCandles,
     settings.chartStyle,
@@ -484,7 +544,7 @@ export function SmcChart() {
       bg?: string;
     }> = [];
 
-    // 2. Dealing Range 50% Equilibrium & OTE (61.8% - 78.6%)
+    // 2. Impulse-Anchored OTE Golden Corridor (0.618 - 0.705 - 0.790) & Equilibrium 50%
     if (layers.ote && quant.dealingRange) {
       const dr = quant.dealingRange;
       const isBearCompass = quant.brain.h4Bias === 'BEARISH' || quant.brain.candidateDirection === 'SHORT';
@@ -496,15 +556,40 @@ export function SmcChart() {
         const yTop = Math.max(padTop, priceToY(oteHigh));
         const yBot = Math.min(padTop + chartH, priceToY(oteLow));
         if (yBot > yTop) {
-          ctx.fillStyle = isBearCompass ? 'rgba(239, 68, 68, 0.055)' : 'rgba(16, 185, 129, 0.055)';
+          // Translucent Golden Corridor Gradient (0.618 - 0.705 - 0.790)
+          const oteGrad = ctx.createLinearGradient(0, yTop, 0, yBot);
+          if (isBearCompass) {
+            oteGrad.addColorStop(0, 'rgba(212, 168, 83, 0.05)');
+            oteGrad.addColorStop(0.5, 'rgba(248, 113, 113, 0.13)');
+            oteGrad.addColorStop(1, 'rgba(212, 168, 83, 0.05)');
+          } else {
+            oteGrad.addColorStop(0, 'rgba(212, 168, 83, 0.05)');
+            oteGrad.addColorStop(0.5, 'rgba(212, 168, 83, 0.16)');
+            oteGrad.addColorStop(1, 'rgba(16, 185, 129, 0.07)');
+          }
+          ctx.fillStyle = oteGrad;
           ctx.fillRect(padLeft, yTop, chartW, yBot - yTop);
+
+          // Crisp 0.618 & 0.790 boundary hairlines
+          ctx.save();
+          ctx.setLineDash([2, 4]);
+          ctx.strokeStyle = 'rgba(229, 191, 112, 0.34)';
+          ctx.lineWidth = 0.9;
+          ctx.beginPath();
+          ctx.moveTo(padLeft, yTop);
+          ctx.lineTo(plotRight, yTop);
+          ctx.moveTo(padLeft, yBot);
+          ctx.lineTo(plotRight, yBot);
+          ctx.stroke();
+          ctx.restore();
         }
         if (oteSweet >= minP && oteSweet <= maxP) {
           const ySweet = priceToY(oteSweet);
+          // Sharp 0.705 Sweet Spot Golden Laser
           ctx.save();
-          ctx.setLineDash([4, 4]);
-          ctx.strokeStyle = isBearCompass ? 'rgba(248, 113, 113, 0.48)' : 'rgba(52, 211, 153, 0.48)';
-          ctx.lineWidth = 1;
+          ctx.setLineDash([6, 3]);
+          ctx.strokeStyle = isBearCompass ? 'rgba(248, 113, 113, 0.80)' : 'rgba(229, 191, 112, 0.88)';
+          ctx.lineWidth = 1.35;
           ctx.beginPath();
           ctx.moveTo(padLeft, ySweet);
           ctx.lineTo(plotRight, ySweet);
@@ -513,10 +598,11 @@ export function SmcChart() {
           levelLabelCandidates.push({
             id: 'ote-sweet',
             desiredY: ySweet - 4,
-            priority: 4,
-            text: `OTE 70.5% ${oteSweet.toFixed(2)}`,
-            color: isBearCompass ? '#fca5a5' : '#6ee7b7',
+            priority: 7,
+            text: `OTE 0.705 SWEET ${oteSweet.toFixed(2)}`,
+            color: isBearCompass ? '#fca5a5' : '#E5BF70',
             side: 'LEFT',
+            bg: 'rgba(11, 15, 23, 0.88)',
           });
         }
       }
@@ -543,7 +629,7 @@ export function SmcChart() {
       }
     }
 
-    // 3. Previous Day High / Low (PDH / PDL)
+    // 3. Previous Day High / Low (PDH / PDL) + Session Liquidity Laser Lines (Asian / London / NY)
     if (settings.showPdhPdl && indicatorSeries.prevDay) {
       const { pdh, pdl } = indicatorSeries.prevDay;
       for (const [id, lbl, val] of [
@@ -554,7 +640,7 @@ export function SmcChart() {
         const y = priceToY(val);
         ctx.save();
         ctx.setLineDash([5, 5]);
-        ctx.strokeStyle = 'rgba(34, 211, 238, 0.42)';
+        ctx.strokeStyle = 'rgba(34, 211, 238, 0.48)';
         ctx.lineWidth = 1;
         ctx.beginPath();
         ctx.moveTo(padLeft, y);
@@ -567,6 +653,39 @@ export function SmcChart() {
           priority: 5,
           text: lbl,
           color: '#22d3ee',
+          side: 'RIGHT',
+        });
+      }
+    }
+
+    if (layers.liquidity && timeframe !== 'H4') {
+      const sl = indicatorSeries.sessionLevels;
+      const sessionDefs: Array<{ id: string; label: string; val: number | null; color: string; stroke: string }> = [
+        { id: 'asia-h', label: 'ASIA H', val: sl.asianHigh, color: '#94a3b8', stroke: 'rgba(148, 163, 184, 0.36)' },
+        { id: 'asia-l', label: 'ASIA L', val: sl.asianLow, color: '#94a3b8', stroke: 'rgba(148, 163, 184, 0.36)' },
+        { id: 'ldn-h', label: 'LDN H', val: sl.londonHigh, color: '#38bdf8', stroke: 'rgba(56, 189, 248, 0.38)' },
+        { id: 'ldn-l', label: 'LDN L', val: sl.londonLow, color: '#38bdf8', stroke: 'rgba(56, 189, 248, 0.38)' },
+        { id: 'ny-h', label: 'NY H', val: sl.nyHigh, color: '#c084fc', stroke: 'rgba(192, 132, 252, 0.38)' },
+        { id: 'ny-l', label: 'NY L', val: sl.nyLow, color: '#c084fc', stroke: 'rgba(192, 132, 252, 0.38)' },
+      ];
+      for (const sDef of sessionDefs) {
+        if (sDef.val === null || sDef.val < minP || sDef.val > maxP) continue;
+        const y = priceToY(sDef.val);
+        ctx.save();
+        ctx.setLineDash([2, 5]);
+        ctx.strokeStyle = sDef.stroke;
+        ctx.lineWidth = 0.9;
+        ctx.beginPath();
+        ctx.moveTo(padLeft, y);
+        ctx.lineTo(plotRight, y);
+        ctx.stroke();
+        ctx.restore();
+        levelLabelCandidates.push({
+          id: sDef.id,
+          desiredY: y - 4,
+          priority: 2,
+          text: `${sDef.label} ${sDef.val.toFixed(1)}`,
+          color: sDef.color,
           side: 'RIGHT',
         });
       }
@@ -789,15 +908,49 @@ export function SmcChart() {
         ctx.restore();
 
         const eqTag = (liq.touches ?? 0) >= 2 ? (liq.side === 'BSL' ? ` EQH×${liq.touches}` : ` EQL×${liq.touches}`) : '';
-        const sweepTag = liq.sweepRejected ? ' SWEEP!' : liq.swept ? ' SWEPT' : '';
+        const sweepTag = liq.sweepRejected ? ' SWEPT & RECLAIMED ⚡' : liq.swept ? ' SWEPT' : '';
         levelLabelCandidates.push({
           id: liq.id,
           desiredY: yL - 4,
-          priority: liq.sweepRejected ? 8 : 6,
+          priority: liq.sweepRejected ? 10 : 6,
           text: `${liq.side}${eqTag} ${liq.level.toFixed(2)}${sweepTag}`,
-          color: liq.side === 'BSL' ? '#38bdf8' : '#fb923c',
+          color: liq.sweepRejected ? '#fde68a' : liq.side === 'BSL' ? '#38bdf8' : '#fb923c',
           side: 'RIGHT',
+          bg: liq.sweepRejected ? 'rgba(180, 83, 9, 0.42)' : undefined,
         });
+
+        // Glowing "SWEPT & RECLAIMED ⚡" callout directly on the sweep wick candle
+        if (liq.sweepRejected && visibleRaw.length > 0) {
+          let sweepCandleIdx = -1;
+          for (let ci = visibleRaw.length - 1; ci >= 0; ci--) {
+            const c = visibleRaw[ci];
+            if (liq.side === 'BSL' && c.high >= liq.level && c.close < liq.level) {
+              sweepCandleIdx = ci;
+              break;
+            }
+            if (liq.side === 'SSL' && c.low <= liq.level && c.close > liq.level) {
+              sweepCandleIdx = ci;
+              break;
+            }
+          }
+          if (sweepCandleIdx >= 0) {
+            const sx = indexToX(sweepCandleIdx);
+            const sc = visibleRaw[sweepCandleIdx];
+            const sy = liq.side === 'BSL' ? priceToY(sc.high) - 10 : priceToY(sc.low) + 18;
+            const badgeText = 'SWEPT & RECLAIMED ⚡';
+            ctx.font = '700 9px "JetBrains Mono", monospace';
+            const bw = ctx.measureText(badgeText).width + 10;
+            const bx = Math.max(padLeft + 4, Math.min(plotRight - bw - 4, sx - bw / 2));
+            const by = Math.max(padTop + 14, Math.min(padTop + chartH - 8, sy));
+            ctx.fillStyle = 'rgba(15, 23, 42, 0.92)';
+            ctx.fillRect(bx, by - 10, bw, 14);
+            ctx.strokeStyle = liq.side === 'BSL' ? '#38bdf8' : '#f59e0b';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(bx, by - 10, bw, 14);
+            ctx.fillStyle = '#fde68a';
+            ctx.fillText(badgeText, bx + 5, by);
+          }
+        }
       }
     }
 
@@ -940,7 +1093,7 @@ export function SmcChart() {
       }
     }
 
-    // 12. Active Positions & Risk/Reward Shaded Zones
+    // 12. Active Positions & Interactive Risk/Reward Projection Box
     for (const pos of positionsToDraw) {
       const isFocused = focusedPosition?.id === pos.id;
       const alpha = isFocused ? 1 : 0.45;
@@ -949,22 +1102,72 @@ export function SmcChart() {
       const yTp1 = priceToY(pos.tp1);
       const yTp2 = priceToY(pos.tp2);
 
-      // Subtle Risk (SL) & Reward (TP1/TP2) shading for focused trade
+      // Institutional RR Projection Box anchored from position entry bar (or right 30% of plot) to live edge
       if (isFocused) {
+        const openTimeSec = Math.floor(pos.openedAtMs / 1000);
+        const anchorX = Math.max(
+          padLeft + chartW * 0.45,
+          Math.min(plotRight - 130, timeToX(openTimeSec) ?? plotRight - Math.max(150, chartW * 0.28))
+        );
+        const boxW = Math.max(96, plotRight - anchorX);
+
+        // Crimson Risk Box (Entry -> SL)
         const riskTop = Math.min(yEntry, ySl);
-        const riskH = Math.abs(ySl - yEntry);
-        ctx.fillStyle = 'rgba(239, 68, 68, 0.065)';
-        ctx.fillRect(padLeft, riskTop, chartW, riskH);
+        const riskH = Math.max(2, Math.abs(ySl - yEntry));
+        const riskGrad = ctx.createLinearGradient(anchorX, riskTop, anchorX, riskTop + riskH);
+        riskGrad.addColorStop(0, 'rgba(239, 68, 68, 0.14)');
+        riskGrad.addColorStop(1, 'rgba(239, 68, 68, 0.06)');
+        ctx.fillStyle = riskGrad;
+        ctx.fillRect(anchorX, riskTop, boxW, riskH);
+        ctx.strokeStyle = 'rgba(239, 68, 68, 0.42)';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(anchorX, riskTop, boxW, riskH);
+
+        // Emerald Reward Box (Entry -> TP1 -> TP2)
+        const tp1Top = Math.min(yEntry, yTp1);
+        const tp1H = Math.max(2, Math.abs(yTp1 - yEntry));
+        ctx.fillStyle = 'rgba(16, 185, 129, 0.12)';
+        ctx.fillRect(anchorX, tp1Top, boxW, tp1H);
 
         const rewTop = Math.min(yEntry, yTp2);
-        const rewH = Math.abs(yTp2 - yEntry);
-        ctx.fillStyle = 'rgba(16, 185, 129, 0.055)';
-        ctx.fillRect(padLeft, rewTop, chartW, rewH);
+        const rewH = Math.max(2, Math.abs(yTp2 - yEntry));
+        const rewGrad = ctx.createLinearGradient(anchorX, rewTop, anchorX, rewTop + rewH);
+        rewGrad.addColorStop(0, 'rgba(16, 185, 129, 0.14)');
+        rewGrad.addColorStop(1, 'rgba(16, 185, 129, 0.05)');
+        ctx.fillStyle = rewGrad;
+        ctx.fillRect(anchorX, rewTop, boxW, rewH);
+        ctx.strokeStyle = 'rgba(16, 185, 129, 0.45)';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(anchorX, rewTop, boxW, rewH);
+
+        // Live R-Multiple Tag inside the projection box
+        const riskDist = Math.max(0.01, Math.abs(pos.entry - pos.initialSl));
+        const liveDelta = pos.direction === 'LONG' ? tick.last - pos.entry : pos.entry - tick.last;
+        const liveR = 'rMultiple' in pos && Number.isFinite(pos.rMultiple) ? pos.rMultiple : liveDelta / riskDist;
+        const tp1R = Math.abs(pos.tp1 - pos.entry) / riskDist;
+        const tp2R = Math.abs(pos.tp2 - pos.entry) / riskDist;
+        const pnlLive = 'netPnl' in pos ? pos.netPnl : pos.unrealizedPnl;
+        const rTag = `${pos.direction} ${liveR >= 0 ? '+' : ''}${liveR.toFixed(2)}R (${pnlLive >= 0 ? '+' : ''}$${pnlLive.toFixed(0)}) · 1:${tp1R.toFixed(1)}/${tp2R.toFixed(1)}`;
+        ctx.font = '700 9px "JetBrains Mono", monospace';
+        const rtw = ctx.measureText(rTag).width + 10;
+        const rbx = Math.max(padLeft + 4, Math.min(plotRight - rtw - 102, anchorX + 4));
+        const rby = Math.max(padTop + 14, Math.min(padTop + chartH - 8, yEntry - 6));
+        ctx.fillStyle = liveR >= 0 ? 'rgba(6, 78, 59, 0.92)' : 'rgba(127, 29, 29, 0.92)';
+        ctx.fillRect(rbx, rby - 11, rtw, 15);
+        ctx.strokeStyle = liveR >= 0 ? '#10B981' : '#EF4444';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(rbx, rby - 11, rtw, 15);
+        ctx.fillStyle = liveR >= 0 ? '#a7f3d0' : '#fecaca';
+        ctx.fillText(rTag, rbx + 5, rby);
       }
 
       const pnlVal = 'netPnl' in pos ? pos.netPnl : pos.unrealizedPnl;
       const pnlStr = `${pnlVal >= 0 ? '+' : ''}$${pnlVal.toFixed(0)}`;
       const tagPrefix = isFocused ? '' : `[${pos.direction[0]}] `;
+      const isBeOrTrail =
+        pos.stage === 'BREAK_EVEN_ARMED' ||
+        pos.stage === 'RISK_FREE_TP1' ||
+        ('trailingStopDistance' in pos && pos.trailingStopDistance !== null);
       const lines = [
         { id: `${pos.id}-tp2`, label: `${tagPrefix}TP2 ${pos.tp2.toFixed(2)}`, price: pos.tp2, color: '#10B981', prio: isFocused ? 10 : 6 },
         { id: `${pos.id}-tp1`, label: `${tagPrefix}TP1 ${pos.tp1.toFixed(2)}`, price: pos.tp1, color: '#34d399', prio: isFocused ? 11 : 6 },
@@ -975,7 +1178,13 @@ export function SmcChart() {
           color: '#E5BF70',
           prio: isFocused ? 14 : 8,
         },
-        { id: `${pos.id}-sl`, label: `${tagPrefix}SL ${pos.stopLoss.toFixed(2)}`, price: pos.stopLoss, color: '#EF4444', prio: isFocused ? 12 : 6 },
+        {
+          id: `${pos.id}-sl`,
+          label: `${tagPrefix}${isBeOrTrail ? 'BE/TRAIL SL' : 'SL'} ${pos.stopLoss.toFixed(2)}`,
+          price: pos.stopLoss,
+          color: isBeOrTrail ? '#38bdf8' : '#EF4444',
+          prio: isFocused ? 12 : 6,
+        },
       ];
 
       for (const ln of lines) {
@@ -1243,6 +1452,7 @@ export function SmcChart() {
     visibleRsi,
     visibleData,
     indicatorSeries.prevDay,
+    indicatorSeries.sessionLevels,
     quant,
     tick,
     focusedPosition,
@@ -1258,124 +1468,304 @@ export function SmcChart() {
   ]);
 
   // =========================================================================
-  // LAYER 2: LIGHTWEIGHT OVERLAY CANVAS (Crosshair + Price/Time Pills + Ruler)
+  // LAYER 2: 60-FPS OVERLAY CANVAS (Holographic Scan Wave + Target Reticles +
+  // Pulsing BE/Trailing SL + Crosshair + Ruler)
   // =========================================================================
-  const drawOverlay = useCallback(() => {
-    const overlay = overlayCanvasRef.current;
-    const geom = geomRef.current;
-    if (!overlay || !geom) return;
-    const ctx = overlay.getContext('2d');
-    if (!ctx) return;
+  const drawOverlay = useCallback(
+    (frameMs = performance.now()) => {
+      const overlay = overlayCanvasRef.current;
+      const geom = geomRef.current;
+      if (!overlay || !geom) return;
+      const ctx = overlay.getContext('2d');
+      if (!ctx) return;
 
-    const dpr = canvasSizeRef.current.dpr || 1;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.direction = 'ltr';
-    ctx.textAlign = 'left';
-    ctx.textBaseline = 'alphabetic';
-    ctx.clearRect(0, 0, geom.width, geom.height);
+      const dpr = canvasSizeRef.current.dpr || 1;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.direction = 'ltr';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+      ctx.clearRect(0, 0, geom.width, geom.height);
 
-    const plotRight = geom.padLeft + geom.chartW;
-    const bottomEdge = geom.showRsiPane ? geom.rsiTop + geom.rsiPaneH : geom.padTop + geom.chartH;
-    const priceToY = (p: number) => geom.padTop + ((geom.maxP - p) / (geom.maxP - geom.minP)) * geom.chartH;
-    const yToPrice = (y: number) => geom.maxP - ((y - geom.padTop) / geom.chartH) * (geom.maxP - geom.minP);
-    const indexToX = (i: number) => geom.padLeft + i * geom.stepX + geom.stepX * 0.5;
+      const plotRight = geom.padLeft + geom.chartW;
+      const bottomEdge = geom.showRsiPane ? geom.rsiTop + geom.rsiPaneH : geom.padTop + geom.chartH;
+      const priceToY = (p: number) => geom.padTop + ((geom.maxP - p) / (geom.maxP - geom.minP)) * geom.chartH;
+      const yToPrice = (y: number) => geom.maxP - ((y - geom.padTop) / geom.chartH) * (geom.maxP - geom.minP);
+      const indexToX = (i: number) => geom.padLeft + i * geom.stepX + geom.stepX * 0.5;
 
-    // 1. Draw Interactive Measure / Ruler Tool Box if active
-    if (rulerStart && rulerEnd) {
-      const x1 = Math.max(geom.padLeft, Math.min(plotRight, indexToX(rulerStart.idx)));
-      const x2 = Math.max(geom.padLeft, Math.min(plotRight, indexToX(rulerEnd.idx)));
-      const y1 = Math.max(geom.padTop, Math.min(geom.padTop + geom.chartH, priceToY(rulerStart.price)));
-      const y2 = Math.max(geom.padTop, Math.min(geom.padTop + geom.chartH, priceToY(rulerEnd.price)));
+      // 0. Holographic Agentic HUD Animations (Clipped strictly inside main price plot)
+      if (hudEnabled && visibleRaw.length > 0) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(geom.padLeft, geom.padTop, geom.chartW, geom.chartH);
+        ctx.clip();
 
-      const metrics = computeRulerMetrics(rulerStart.price, rulerEnd.price, rulerStart.idx, rulerEnd.idx, timeframe);
-      const isUp = metrics.deltaUsd >= 0;
+        const highConfluence = quant.brain.totalScore >= 65 || quant.brain.goldenConfluence || proposals.some((p) => p.status === 'PROPOSED');
+        const scanActive = agentBusy || agentEnabled || highConfluence;
+        const pulse = 0.5 + 0.5 * Math.sin(frameMs * 0.0045);
 
-      ctx.fillStyle = isUp ? 'rgba(16, 185, 129, 0.14)' : 'rgba(239, 68, 68, 0.14)';
-      ctx.strokeStyle = isUp ? 'rgba(52, 211, 153, 0.85)' : 'rgba(248, 113, 113, 0.85)';
-      ctx.lineWidth = 1.2;
-      ctx.fillRect(Math.min(x1, x2), Math.min(y1, y2), Math.abs(x2 - x1), Math.abs(y2 - y1));
-      ctx.strokeRect(Math.min(x1, x2), Math.min(y1, y2), Math.abs(x2 - x1), Math.abs(y2 - y1));
+        // 0A. Subtle Holographic Vertical Laser Scan Wave across recent candles
+        if (scanActive) {
+          const sweepSpanStart = geom.padLeft + geom.chartW * 0.56;
+          const sweepSpanW = geom.chartW * 0.44;
+          const periodMs = agentBusy ? 1800 : 4600;
+          const phase = (frameMs % periodMs) / periodMs;
+          const beamX = sweepSpanStart + phase * sweepSpanW;
+          const beamTrailW = agentBusy ? 64 : 42;
 
-      const sign = isUp ? '+' : '';
-      const line1 = `${sign}$${metrics.deltaUsd.toFixed(2)} (${sign}${metrics.deltaPct.toFixed(2)}%) · ${sign}${metrics.pips} pips`;
-      const line2 = `${metrics.bars} bars · ${metrics.durationLabel}`;
-      ctx.font = '600 10px "JetBrains Mono", monospace';
-      const boxW = Math.max(ctx.measureText(line1).width, ctx.measureText(line2).width) + 14;
-      const boxH = 30;
-      const bx = Math.max(geom.padLeft + 4, Math.min(plotRight - boxW - 4, (x1 + x2) / 2 - boxW / 2));
-      const by = Math.max(geom.padTop + 4, Math.min(geom.padTop + geom.chartH - boxH - 4, Math.min(y1, y2) - boxH - 6));
+          const grad = ctx.createLinearGradient(beamX - beamTrailW, 0, beamX + 6, 0);
+          if (agentBusy) {
+            grad.addColorStop(0, 'rgba(56, 189, 248, 0)');
+            grad.addColorStop(0.75, 'rgba(212, 168, 83, 0.13)');
+            grad.addColorStop(1, 'rgba(229, 191, 112, 0.28)');
+          } else {
+            grad.addColorStop(0, 'rgba(212, 168, 83, 0)');
+            grad.addColorStop(0.8, 'rgba(212, 168, 83, 0.05)');
+            grad.addColorStop(1, 'rgba(229, 191, 112, 0.14)');
+          }
+          ctx.fillStyle = grad;
+          ctx.fillRect(beamX - beamTrailW, geom.padTop, beamTrailW + 6, geom.chartH);
 
-      ctx.fillStyle = 'rgba(15, 23, 42, 0.94)';
-      ctx.fillRect(bx, by, boxW, boxH);
-      ctx.strokeStyle = isUp ? '#10B981' : '#EF4444';
-      ctx.strokeRect(bx, by, boxW, boxH);
-      ctx.fillStyle = isUp ? '#6ee7b7' : '#fca5a5';
-      ctx.fillText(line1, bx + 7, by + 12);
-      ctx.fillStyle = '#cbd5e1';
-      ctx.fillText(line2, bx + 7, by + 24);
-    }
+          ctx.strokeStyle = agentBusy ? 'rgba(229, 191, 112, 0.58)' : 'rgba(212, 168, 83, 0.25)';
+          ctx.lineWidth = agentBusy ? 1.4 : 1;
+          ctx.beginPath();
+          ctx.moveTo(beamX, geom.padTop);
+          ctx.lineTo(beamX, geom.padTop + geom.chartH);
+          ctx.stroke();
+        }
 
-    // 2. Draw Free-Moving Crosshair + Right-Axis Price Tag + Bottom Time Tag
-    const hover = hoverStateRef.current;
-    if (!hover || hover.x < geom.padLeft || hover.x > plotRight || hover.y < geom.padTop || hover.y > bottomEdge) {
-      return;
-    }
+        // Helper: Draw a tactical sniper reticle ring with corner brackets
+        const drawReticle = (cx: number, cy: number, color: string, label: string, phaseShift = 0) => {
+          if (cy < geom.padTop + 6 || cy > geom.padTop + geom.chartH - 6) return;
+          const p = 0.5 + 0.5 * Math.sin(frameMs * 0.005 + phaseShift);
+          const outerR = 11 + p * 5;
+          const innerR = 4.5;
 
-    const snappedX =
-      hover.idx !== null && visibleRaw[hover.idx] ? indexToX(hover.idx) : hover.x;
-    const crossY = hover.y;
+          ctx.save();
+          ctx.strokeStyle = color;
+          ctx.globalAlpha = 0.32 + p * 0.48;
+          ctx.lineWidth = 1.25;
+          ctx.beginPath();
+          ctx.arc(cx, cy, outerR, 0, Math.PI * 2);
+          ctx.stroke();
 
-    ctx.save();
-    ctx.setLineDash([3, 3]);
-    ctx.strokeStyle = 'rgba(226, 232, 240, 0.36)';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(snappedX, geom.padTop);
-    ctx.lineTo(snappedX, bottomEdge);
-    ctx.moveTo(geom.padLeft, crossY);
-    ctx.lineTo(plotRight, crossY);
-    ctx.stroke();
-    ctx.restore();
+          ctx.globalAlpha = 0.88;
+          ctx.lineWidth = 1.35;
+          ctx.beginPath();
+          ctx.arc(cx, cy, innerR, 0, Math.PI * 2);
+          ctx.stroke();
 
-    // Right-axis price / RSI tag
-    if (crossY >= geom.padTop && crossY <= geom.padTop + geom.chartH) {
-      const hoverPrice = yToPrice(crossY);
-      ctx.fillStyle = '#334155';
-      ctx.fillRect(plotRight + 2, crossY - 9, geom.padRight - 6, 18);
-      ctx.fillStyle = '#f8fafc';
-      ctx.font = '600 10.5px "JetBrains Mono", monospace';
-      ctx.fillText(hoverPrice.toFixed(2), plotRight + 7, crossY + 3.5);
-    } else if (geom.showRsiPane && crossY >= geom.rsiTop && crossY <= geom.rsiTop + geom.rsiPaneH) {
-      const rsiVal = Math.max(0, Math.min(100, 100 - ((crossY - geom.rsiTop) / geom.rsiPaneH) * 100));
-      ctx.fillStyle = '#334155';
-      ctx.fillRect(plotRight + 2, crossY - 8, 48, 16);
-      ctx.fillStyle = '#f8fafc';
-      ctx.font = '600 10px "JetBrains Mono", monospace';
-      ctx.fillText(rsiVal.toFixed(1), plotRight + 7, crossY + 3.5);
-    }
+          // Crosshair ticks
+          const tickLen = 4;
+          ctx.beginPath();
+          ctx.moveTo(cx - outerR - tickLen, cy);
+          ctx.lineTo(cx - innerR - 2, cy);
+          ctx.moveTo(cx + innerR + 2, cy);
+          ctx.lineTo(cx + outerR + tickLen, cy);
+          ctx.moveTo(cx, cy - outerR - tickLen);
+          ctx.lineTo(cx, cy - innerR - 2);
+          ctx.moveTo(cx, cy + innerR + 2);
+          ctx.lineTo(cx, cy + outerR + tickLen);
+          ctx.stroke();
 
-    // Bottom-axis exact timestamp pill
-    if (hover.idx !== null && visibleRaw[hover.idx]) {
-      const tsLabel = formatFullUtcTimestamp(visibleRaw[hover.idx].time);
-      ctx.font = '600 10px "JetBrains Mono", monospace';
-      const tw = ctx.measureText(tsLabel).width + 10;
-      const bx = Math.max(geom.padLeft, Math.min(plotRight - tw, snappedX - tw / 2));
-      ctx.fillStyle = '#334155';
-      ctx.fillRect(bx, geom.height - 20, tw, 16);
-      ctx.fillStyle = '#f8fafc';
-      ctx.fillText(tsLabel, bx + 5, geom.height - 9);
-    }
-  }, [visibleRaw, rulerStart, rulerEnd, timeframe]);
+          // Compact HUD label placed cleanly to the left of reticle to avoid right-edge session labels
+          ctx.font = '700 8.8px "JetBrains Mono", monospace';
+          const tw = ctx.measureText(label).width + 8;
+          const lx = Math.max(geom.padLeft + 4, Math.min(plotRight - tw - 104, cx - outerR - tw - 6));
+          const ly = Math.max(geom.padTop + 14, Math.min(geom.padTop + geom.chartH - 6, cy + 3));
+          ctx.fillStyle = 'rgba(11, 15, 23, 0.88)';
+          ctx.fillRect(lx, ly - 10, tw, 13);
+          ctx.strokeStyle = color;
+          ctx.globalAlpha = 0.55;
+          ctx.lineWidth = 0.8;
+          ctx.strokeRect(lx, ly - 10, tw, 13);
+          ctx.globalAlpha = 1;
+          ctx.fillStyle = color;
+          ctx.fillText(label, lx + 4, ly);
+          ctx.restore();
+        };
 
+        // 0B. Pulsing Sniper Reticle on Swept Liquidity Wick
+        const sweptPool = quant.liquidity.find((l) => l.sweepRejected);
+        if (sweptPool) {
+          for (let ci = visibleRaw.length - 1; ci >= 0; ci--) {
+            const c = visibleRaw[ci];
+            const isBslSweep = sweptPool.side === 'BSL' && c.high >= sweptPool.level && c.close < sweptPool.level;
+            const isSslSweep = sweptPool.side === 'SSL' && c.low <= sweptPool.level && c.close > sweptPool.level;
+            if (isBslSweep || isSslSweep) {
+              const sx = indexToX(ci);
+              const sy = priceToY(isBslSweep ? c.high : c.low);
+              drawReticle(sx, sy, isBslSweep ? '#38bdf8' : '#fb923c', `${sweptPool.side} SWEEP`, 0);
+              break;
+            }
+          }
+        }
+
+        // 0C. Pulsing Golden Sniper Entry Reticle on OTE 0.705 / FVG CE50 Intersection
+        const dr = quant.dealingRange;
+        const isBear = quant.brain.h4Bias === 'BEARISH' || quant.brain.candidateDirection === 'SHORT';
+        const oteSweet = isBear ? dr.oteShortSweetSpot : dr.oteLongSweetSpot;
+        const goldenFvg = quant.fvgs.find((f) => !f.mitigated && (isBear ? f.direction === 'BEARISH' : f.direction === 'BULLISH'));
+        const sniperPrice = quant.brain.watchlistZone?.optimalEntry ?? goldenFvg?.ce50 ?? oteSweet;
+        if (Number.isFinite(sniperPrice) && sniperPrice >= geom.minP && sniperPrice <= geom.maxP) {
+          const rx = Math.min(plotRight - 58, indexToX(visibleRaw.length - 1) + geom.stepX * 1.5);
+          const ry = priceToY(sniperPrice);
+          drawReticle(
+            rx,
+            ry,
+            '#E5BF70',
+            goldenFvg ? `SNIPER CE50 ${sniperPrice.toFixed(1)}` : `OTE 70.5% ${sniperPrice.toFixed(1)}`,
+            Math.PI * 0.65
+          );
+        }
+
+        // 0D. Pulsing Breakeven / Trailing Stop Beacon on Focused Broker Position
+        if (focusedPosition) {
+          const isBeOrTrail =
+            focusedPosition.stage === 'BREAK_EVEN_ARMED' ||
+            focusedPosition.stage === 'RISK_FREE_TP1' ||
+            ('trailingStopDistance' in focusedPosition && focusedPosition.trailingStopDistance !== null);
+          if (isBeOrTrail && focusedPosition.stopLoss >= geom.minP && focusedPosition.stopLoss <= geom.maxP) {
+            const ySl = priceToY(focusedPosition.stopLoss);
+            const bx = plotRight - 14;
+            ctx.save();
+            ctx.strokeStyle = '#38bdf8';
+            ctx.globalAlpha = 0.3 + pulse * 0.65;
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            ctx.arc(bx, ySl, 4 + pulse * 5, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.fillStyle = '#38bdf8';
+            ctx.globalAlpha = 0.95;
+            ctx.beginPath();
+            ctx.arc(bx, ySl, 2.5, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+          }
+        }
+
+        ctx.restore();
+      }
+
+      // 1. Draw Interactive Measure / Ruler Tool Box if active
+      if (rulerStart && rulerEnd) {
+        const x1 = Math.max(geom.padLeft, Math.min(plotRight, indexToX(rulerStart.idx)));
+        const x2 = Math.max(geom.padLeft, Math.min(plotRight, indexToX(rulerEnd.idx)));
+        const y1 = Math.max(geom.padTop, Math.min(geom.padTop + geom.chartH, priceToY(rulerStart.price)));
+        const y2 = Math.max(geom.padTop, Math.min(geom.padTop + geom.chartH, priceToY(rulerEnd.price)));
+
+        const metrics = computeRulerMetrics(rulerStart.price, rulerEnd.price, rulerStart.idx, rulerEnd.idx, timeframe);
+        const isUp = metrics.deltaUsd >= 0;
+
+        ctx.fillStyle = isUp ? 'rgba(16, 185, 129, 0.14)' : 'rgba(239, 68, 68, 0.14)';
+        ctx.strokeStyle = isUp ? 'rgba(52, 211, 153, 0.85)' : 'rgba(248, 113, 113, 0.85)';
+        ctx.lineWidth = 1.2;
+        ctx.fillRect(Math.min(x1, x2), Math.min(y1, y2), Math.abs(x2 - x1), Math.abs(y2 - y1));
+        ctx.strokeRect(Math.min(x1, x2), Math.min(y1, y2), Math.abs(x2 - x1), Math.abs(y2 - y1));
+
+        const sign = isUp ? '+' : '';
+        const line1 = `${sign}$${metrics.deltaUsd.toFixed(2)} (${sign}${metrics.deltaPct.toFixed(2)}%) · ${sign}${metrics.pips} pips`;
+        const line2 = `${metrics.bars} bars · ${metrics.durationLabel}`;
+        ctx.font = '600 10px "JetBrains Mono", monospace';
+        const boxW = Math.max(ctx.measureText(line1).width, ctx.measureText(line2).width) + 14;
+        const boxH = 30;
+        const bx = Math.max(geom.padLeft + 4, Math.min(plotRight - boxW - 4, (x1 + x2) / 2 - boxW / 2));
+        const by = Math.max(geom.padTop + 4, Math.min(geom.padTop + geom.chartH - boxH - 4, Math.min(y1, y2) - boxH - 6));
+
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.94)';
+        ctx.fillRect(bx, by, boxW, boxH);
+        ctx.strokeStyle = isUp ? '#10B981' : '#EF4444';
+        ctx.strokeRect(bx, by, boxW, boxH);
+        ctx.fillStyle = isUp ? '#6ee7b7' : '#fca5a5';
+        ctx.fillText(line1, bx + 7, by + 12);
+        ctx.fillStyle = '#cbd5e1';
+        ctx.fillText(line2, bx + 7, by + 24);
+      }
+
+      // 2. Draw Free-Moving Crosshair + Right-Axis Price Tag + Bottom Time Tag
+      const hover = hoverStateRef.current;
+      if (!hover || hover.x < geom.padLeft || hover.x > plotRight || hover.y < geom.padTop || hover.y > bottomEdge) {
+        return;
+      }
+
+      const snappedX =
+        hover.idx !== null && visibleRaw[hover.idx] ? indexToX(hover.idx) : hover.x;
+      const crossY = hover.y;
+
+      ctx.save();
+      ctx.setLineDash([3, 3]);
+      ctx.strokeStyle = 'rgba(226, 232, 240, 0.36)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(snappedX, geom.padTop);
+      ctx.lineTo(snappedX, bottomEdge);
+      ctx.moveTo(geom.padLeft, crossY);
+      ctx.lineTo(plotRight, crossY);
+      ctx.stroke();
+      ctx.restore();
+
+      // Right-axis price / RSI tag
+      if (crossY >= geom.padTop && crossY <= geom.padTop + geom.chartH) {
+        const hoverPrice = yToPrice(crossY);
+        ctx.fillStyle = '#334155';
+        ctx.fillRect(plotRight + 2, crossY - 9, geom.padRight - 6, 18);
+        ctx.fillStyle = '#f8fafc';
+        ctx.font = '600 10.5px "JetBrains Mono", monospace';
+        ctx.fillText(hoverPrice.toFixed(2), plotRight + 7, crossY + 3.5);
+      } else if (geom.showRsiPane && crossY >= geom.rsiTop && crossY <= geom.rsiTop + geom.rsiPaneH) {
+        const rsiVal = Math.max(0, Math.min(100, 100 - ((crossY - geom.rsiTop) / geom.rsiPaneH) * 100));
+        ctx.fillStyle = '#334155';
+        ctx.fillRect(plotRight + 2, crossY - 8, 48, 16);
+        ctx.fillStyle = '#f8fafc';
+        ctx.font = '600 10px "JetBrains Mono", monospace';
+        ctx.fillText(rsiVal.toFixed(1), plotRight + 7, crossY + 3.5);
+      }
+
+      // Bottom-axis exact timestamp pill
+      if (hover.idx !== null && visibleRaw[hover.idx]) {
+        const tsLabel = formatFullUtcTimestamp(visibleRaw[hover.idx].time);
+        ctx.font = '600 10px "JetBrains Mono", monospace';
+        const tw = ctx.measureText(tsLabel).width + 10;
+        const bx = Math.max(geom.padLeft, Math.min(plotRight - tw, snappedX - tw / 2));
+        ctx.fillStyle = '#334155';
+        ctx.fillRect(bx, geom.height - 20, tw, 16);
+        ctx.fillStyle = '#f8fafc';
+        ctx.fillText(tsLabel, bx + 5, geom.height - 9);
+      }
+    },
+    [visibleRaw, rulerStart, rulerEnd, timeframe, hudEnabled, quant, agentBusy, agentEnabled, proposals, focusedPosition]
+  );
+
+  // Smooth, CPU-conscious overlay animation loop (respects prefers-reduced-motion, zero React setState)
   useEffect(() => {
-    drawOverlay();
-  }, [drawOverlay, size, visibleRaw]);
+    drawOverlay(performance.now());
+    if (!hudEnabled) return;
+    const reduced =
+      typeof window !== 'undefined' &&
+      window.matchMedia &&
+      window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (reduced) return;
+
+    let rafId = 0;
+    let lastDrawMs = 0;
+    const minFrameGapMs = agentBusy ? 24 : 55; // Smooth 40-60fps during scan, calm low-CPU ambient pulse
+
+    const step = (ts: number) => {
+      const modalOpen = Boolean(document.querySelector('[role="dialog"]'));
+      if (!document.hidden && !modalOpen && ts - lastDrawMs >= minFrameGapMs) {
+        lastDrawMs = ts;
+        drawOverlay(ts);
+      }
+      rafId = window.requestAnimationFrame(step);
+    };
+    rafId = window.requestAnimationFrame(step);
+    return () => window.cancelAnimationFrame(rafId);
+  }, [drawOverlay, size, visibleRaw, hudEnabled, agentBusy]);
 
   const scheduleOverlayDraw = useCallback(() => {
     if (rafOverlayRef.current !== null) return;
-    rafOverlayRef.current = window.requestAnimationFrame(() => {
+    rafOverlayRef.current = window.requestAnimationFrame((ts) => {
       rafOverlayRef.current = null;
-      drawOverlay();
+      drawOverlay(ts);
     });
   }, [drawOverlay]);
 
@@ -1501,6 +1891,9 @@ export function SmcChart() {
           : 'relative rounded-lg border border-white/8 bg-[#111827] overflow-hidden flex flex-col'
       }
     >
+      {/* Embedded Multi-Agent Neural Pulse Pipeline + 5-Stage Sniper Bar + Cognitive Stream */}
+      {hudEnabled && <AgentNeuralHud />}
+
       {/* Chart Toolbar — Strict LTR, Single-Row Desktop & Mobile-Safe Wrapping */}
       <div className="px-2.5 py-1.5 border-b border-white/8 flex flex-wrap items-center justify-between gap-1.5">
         <div className="flex flex-wrap items-center gap-1.5 min-w-0">
@@ -1564,6 +1957,21 @@ export function SmcChart() {
                 {label}
               </button>
             ))}
+            <button
+              type="button"
+              onClick={() => setHudEnabled((v) => !v)}
+              aria-pressed={hudEnabled}
+              data-testid="chart-hud-toggle"
+              title="Toggle Agentic Neural HUD, Scan Wave & Sniper Reticles"
+              className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded font-mono text-[10.5px] border transition-colors whitespace-nowrap ${
+                hudEnabled
+                  ? 'border-sky-400/50 bg-sky-500/14 text-sky-300'
+                  : 'border-white/8 text-slate-500 hover:text-slate-300'
+              }`}
+            >
+              <Sparkles className="w-3 h-3" />
+              <span>HUD</span>
+            </button>
           </div>
         </div>
 

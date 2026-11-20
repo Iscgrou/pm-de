@@ -365,35 +365,6 @@ export interface BasisDivergence {
 
 export type ProposalStatus = 'PROPOSED' | 'CONFIRMED' | 'DISMISSED';
 
-export type ProposalLifecycleStatus =
-  | 'ACTIVE'
-  | 'PENDING_LIMIT_IN_BROKER'
-  | 'FILLED_IN_BROKER'
-  | 'EXPIRED_TTL'
-  | 'INVALIDATED_STRUCTURE'
-  | 'CANCELLED_FRONT_RUN';
-
-export type FeedConnectionMode = 'LIVE_INTERBANK' | 'CONNECTING' | 'FEED_DISCONNECTED';
-
-export interface AiSubAgentTelemetry {
-  status: string;
-  latencyMs?: number;
-  summary?: string;
-}
-
-export interface AiTelemetryState {
-  activeStage: number;
-  subAgents: Record<string, AiSubAgentTelemetry>;
-  latestThinkingTrace?: string;
-}
-
-export type PositionCoPilotDirective =
-  | 'HOLD_STEADY'
-  | 'MOVE_SL_TO_BREAKEVEN'
-  | 'PARTIAL_TAKE_PROFIT_TP1'
-  | 'TRAIL_STOP_STRUCTURAL'
-  | 'EMERGENCY_EXIT_NOW';
-
 export interface AgentProposal {
   id: string;
   direction: 'LONG' | 'SHORT';
@@ -427,18 +398,6 @@ export interface AgentProposal {
   goldenConfluence?: boolean;
   /** True when trading against H4 trend (capped risk scalp) */
   counterTrendFlag?: boolean;
-  /** Squad 3 Signal Lifecycle, Sniper Zone, TTL & Red-Team Extensions */
-  orderType?: 'LIMIT' | 'MARKET';
-  sniperZone?: { low: number; high: number; sweetSpot: number };
-  invalidationPrice?: number;
-  expiresAtTime?: number;
-  ttlBarsRemaining?: number;
-  proposalLifecycleStatus?: ProposalLifecycleStatus;
-  redTeamRiskScore?: number;
-  redTeamNotes?: string[];
-  thinkingTrace?: string;
-  /** Unix timestamp (seconds) of the last timeframe candle observed for TTL bar countdown */
-  lastBarTimeSeen?: number;
 }
 
 export type OrderExecutionType = 'MARKET' | 'LIMIT';
@@ -495,18 +454,7 @@ export interface ConfirmedPosition extends Position {
   adviceEn: string;
   adviceFa: string;
   lastReviewedMs: number;
-  /** Squad 3 Live Broker Co-Pilot Directive Extensions */
-  latestDirective?: PositionCoPilotDirective;
-  recommendedActionPrice?: number;
-  recommendedScaleOutPct?: number;
-  directiveUrgency?: 'NORMAL' | 'HIGH' | 'CRITICAL';
-  directiveRationaleFa?: string;
-  directiveRationaleEn?: string;
-  thinkingTrace?: string;
 }
-
-export type BrokerPosition = ConfirmedPosition;
-export type SimulatedTrade = ConfirmedPosition;
 
 export interface ClosedTradeRecord {
   id: string;

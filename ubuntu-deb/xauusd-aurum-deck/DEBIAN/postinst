@@ -1,34 +1,52 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_DIR="/opt/xauusd-agy-advisor"
-CACHE_DIR="${APP_DIR}/cache"
-STORAGE_DIR="${APP_DIR}/storage"
+APP_DIR="/opt/xauusd-aurum-deck"
+LOG_DIR="${APP_DIR}/logs"
+CONF_DIR="/etc/xauusd-aurum-deck"
+ENV_FILE="${CONF_DIR}/env"
 
-echo "[xauusd-aurum-deck] Post-installation setup starting..."
-mkdir -p "${CACHE_DIR}" "${STORAGE_DIR}"
+echo "[xauusd-aurum-deck] Ubuntu 24.04 LTS post-installation setup starting..."
+mkdir -p "${LOG_DIR}" "${CONF_DIR}"
 
-if [ ! -d "${APP_DIR}/.venv" ]; then
-  echo "[xauusd-aurum-deck] Creating Python virtual environment..."
-  python3 -m venv "${APP_DIR}/.venv"
+if [ ! -f "${ENV_FILE}" ]; then
+  cat > "${ENV_FILE}" <<'EOF'
+# Payam XAUUSD Aurum Command Deck — Runtime Configuration
+PORT=3000
+NODE_ENV=production
+# Optional: Gemini API Key (not required when using local agy / CLIProxyAPI OAuth)
+# GEMINI_API_KEY=
+# Local Antigravity / Gemini Subscription OAuth Proxy (started via xauusd-ai-oauth-bridge)
+XAUUSD_OAUTH_PROXY_URL=http://127.0.0.1:8080/v1
+# Optional: TimescaleDB / PostgreSQL persistence
+# DATABASE_URL=postgresql://aurum:aurum@127.0.0.1:5432/xauusd_deck
+EOF
+  chmod 0640 "${ENV_FILE}"
 fi
 
-echo "[xauusd-aurum-deck] Installing Python dependencies..."
-"${APP_DIR}/.venv/bin/pip" install --quiet --upgrade pip
-"${APP_DIR}/.venv/bin/pip" install --quiet -r "${APP_DIR}/requirements.txt"
-
-echo "[xauusd-aurum-deck] Initializing SQLite WAL database schema..."
-sqlite3 "${STORAGE_DIR}/trading.db" < "${STORAGE_DIR}/schema.sql"
+if [ -f "${APP_DIR}/package.json" ] && [ ! -d "${APP_DIR}/node_modules" ]; then
+  echo "[xauusd-aurum-deck] Installing Node.js production dependencies in ${APP_DIR}..."
+  (
+    cd "${APP_DIR}"
+    npm install --omit=dev --no-audit --no-fund || npm install --no-audit --no-fund
+  )
+fi
 
 if [ -d /run/systemd/system ]; then
   systemctl daemon-reload
-  systemctl enable xauusd-sentinel.service || true
-  systemctl restart xauusd-sentinel.service || true
+  systemctl enable xauusd-aurum-deck.service || true
+  systemctl restart xauusd-aurum-deck.service || true
 fi
 
 if command -v update-desktop-database >/dev/null 2>&1; then
   update-desktop-database /usr/share/applications || true
 fi
 
-echo "[xauusd-aurum-deck] Installation complete. Open http://127.0.0.1:8787 or run 'xauusd-aurum-deck'."
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+  gtk-update-icon-cache -f -t /usr/share/icons/hicolor || true
+fi
+
+echo "[xauusd-aurum-deck] Setup complete!"
+echo "  • Open Workstation : xauusd-aurum-deck open  (http://127.0.0.1:3000)"
+echo "  • OAuth CLI Bridge : xauusd-ai-oauth-bridge login"
 exit 0

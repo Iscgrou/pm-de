@@ -1,11 +1,11 @@
 [Desktop Entry]
-Name=Aurum Command Deck (XAUUSD)
-GenericName=XAUUSD Institutional Trading System
-Comment=System 1 SMC Quant Engine & System 2 Agentic Copilot Workstation
-Exec=/usr/bin/xauusd-aurum-deck
-Icon=utilities-system-monitor
+Name=Payam XAUUSD — Aurum Command Deck
+GenericName=XAUUSD Institutional Trading Workstation
+Comment=Unified TypeScript/React XAUUSD SMC Quant Engine & 5-Sub-Agent AI Cockpit
+Exec=/usr/bin/xauusd-aurum-deck open
+Icon=payam-xauusd
 Terminal=false
 Type=Application
 Categories=Office;Finance;Development;
-Keywords=XAUUSD;Gold;SMC;Trading;Quant;Aurum;
+Keywords=XAUUSD;Gold;SMC;ICT;Trading;Quant;Aurum;Payam;Antigravity;
 StartupNotify=true

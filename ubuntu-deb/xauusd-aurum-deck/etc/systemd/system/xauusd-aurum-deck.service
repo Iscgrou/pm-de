@@ -1,0 +1,23 @@
+[Unit]
+Description=Payam XAUUSD Aurum Command Deck (Unified Node.js/TypeScript + React Workstation)
+Documentation=https://github.com/payam-xauusd/aurum-command-deck
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/xauusd-aurum-deck
+Environment=NODE_ENV=production
+Environment=PORT=3000
+Environment=DISABLE_HMR=true
+Environment=XAUUSD_OAUTH_PROXY_URL=http://127.0.0.1:8080/v1
+EnvironmentFile=-/etc/xauusd-aurum-deck/env
+ExecStart=/usr/bin/env npx --no-install tsx /opt/xauusd-aurum-deck/server.ts
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+StandardOutput=append:/opt/xauusd-aurum-deck/logs/aurum-deck.log
+StandardError=append:/opt/xauusd-aurum-deck/logs/aurum-deck.log
+
+[Install]
+WantedBy=multi-user.target
