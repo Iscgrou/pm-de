@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$1" = "purge" ]; then
+  rm -rf /opt/xauusd-agy-advisor/.venv /opt/xauusd-agy-advisor/cache
+  echo "[xauusd-aurum-deck] Purged runtime cache and virtualenv (trading.db preserved unless manually removed)."
+fi
+
+if [ -d /run/systemd/system ]; then
+  systemctl daemon-reload || true
+fi
+
+exit 0

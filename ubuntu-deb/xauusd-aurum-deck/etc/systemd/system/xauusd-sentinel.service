@@ -1,0 +1,20 @@
+[Unit]
+Description=XAUUSD Institutional Sentinel Server (Aurum Command Deck)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/xauusd-agy-advisor
+ExecStart=/opt/xauusd-agy-advisor/.venv/bin/uvicorn sentinel_app.server:app --host 127.0.0.1 --port 8787 --log-level info
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+Environment=XAUUSD_DB_PATH=/opt/xauusd-agy-advisor/storage/trading.db
+Environment=XAUUSD_LOG_PATH=/opt/xauusd-agy-advisor/cache/sentinel_server.log
+LimitNOFILE=65535
+StandardOutput=append:/opt/xauusd-agy-advisor/cache/sentinel_server.log
+StandardError=append:/opt/xauusd-agy-advisor/cache/sentinel_server.log
+
+[Install]
+WantedBy=multi-user.target

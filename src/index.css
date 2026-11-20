@@ -1,0 +1,69 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --font-display: 'Vazirmatn', 'Plus Jakarta Sans', system-ui, sans-serif;
+    --font-body: 'Vazirmatn', 'DM Sans', system-ui, sans-serif;
+    --font-mono: 'JetBrains Mono', 'Vazirmatn', ui-monospace, SFMono-Regular, monospace;
+    --font-fa: 'Vazirmatn', 'DM Sans', system-ui, sans-serif;
+  }
+
+  html,
+  body {
+    font-family: var(--font-body);
+    background-color: #0b0f17;
+    color: #e2e8f0;
+    letter-spacing: 0;
+  }
+
+  h1,
+  h2,
+  h3,
+  .font-display {
+    font-family: var(--font-display);
+    text-wrap: balance;
+  }
+
+  code,
+  pre,
+  .font-mono {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .font-fa {
+    font-family: var(--font-fa);
+  }
+
+  .ltr-token {
+    direction: ltr;
+    unicode-bidi: isolate;
+    display: inline-block;
+  }
+
+  .ltr-surface {
+    direction: ltr;
+    text-align: left;
+    unicode-bidi: isolate;
+  }
+}
+
+/* Custom subtle dark scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0b0f17;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #1f2937;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #374151;
+}

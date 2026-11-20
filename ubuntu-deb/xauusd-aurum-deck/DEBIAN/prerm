@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ -d /run/systemd/system ]; then
+  if systemctl is-active --quiet xauusd-sentinel.service; then
+    systemctl stop xauusd-sentinel.service || true
+  fi
+  if systemctl is-enabled --quiet xauusd-sentinel.service; then
+    systemctl disable xauusd-sentinel.service || true
+  fi
+fi
+
+exit 0

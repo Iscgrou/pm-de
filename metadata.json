@@ -1,0 +1,6 @@
+{
+  "name": "Aurum Command Deck — XAUUSD Institutional Trading System & Ubuntu .deb Suite",
+  "description": "Full-stack XAUUSD institutional SMC trading workstation (System 1 Quant + System 2 Agentic Copilot + 18-Gate Audit) with complete Ubuntu .deb packaging and Python/FastAPI/SQLite/MCP source tree.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

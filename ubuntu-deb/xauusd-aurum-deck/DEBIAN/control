@@ -1,0 +1,16 @@
+Package: xauusd-aurum-deck
+Version: 2.0.0
+Section: finance
+Priority: optional
+Architecture: amd64
+Maintainer: Payam Institutional Quant Engineering <ops@xauusd-aurum.local>
+Depends: python3 (>= 3.11), python3-venv, python3-pip, sqlite3, curl, jq, systemd
+Recommends: google-chrome-stable | chromium-browser, nodejs (>= 20.0)
+Description: Payam XAUUSD Institutional Trading System & Aurum Command Deck v2
+ Full-stack Ubuntu trading workstation implementing Payam Brain v3
+ (4H Compass + 1H/15M/5M SMC OB/FVG/Sweep + Wilder RSI-14 + 7-Gate Shield),
+ 14-source Core Gold News & Macro RSS/ForexFactory aggregator with shock veto,
+ 7 Deterministic Risk Circuit Breakers + Emergency Kill Switch + Audit Log,
+ 11-tool FastMCP bridge, 3-tier market data failover, SQLite WAL WITHOUT ROWID
+ time-series storage with 5-step CrashRecovery, and 18-gate audit on port 8787.
+Installed-Size: 469

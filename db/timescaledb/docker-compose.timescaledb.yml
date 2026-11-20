@@ -1,0 +1,23 @@
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: payam-xauusd-timescaledb
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_DB: payam_xauusd
+      POSTGRES_USER: payam_trader
+      POSTGRES_PASSWORD: payam_local_secure_change_me
+      TIMESCALEDB_TELEMETRY: "off"
+    volumes:
+      - payam_timescale_data:/var/lib/postgresql/data
+      - ./001_init_timescaledb.sql:/docker-entrypoint-initdb.d/001_init_timescaledb.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payam_trader -d payam_xauusd"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  payam_timescale_data:
